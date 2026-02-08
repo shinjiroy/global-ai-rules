@@ -1,0 +1,6 @@
+---
+description: "Docker環境のルール（実行環境やTerraform等は全てDockerで準備し、docker-compose.yamlを準備すること）"
+alwaysApply: false
+---
+
+実行環境やTerraform等は全てDockerで準備すること。さらに、ローカルでの動作確認用としてdocker-compose.yamlを準備すること。

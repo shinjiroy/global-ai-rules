@@ -1,0 +1,10 @@
+---
+description: "共通設定"
+alwaysApply: true
+---
+
+## 共通設定
+
+- 日本語で回答すること
+- WebFetchの代わりにmcp__readability__read_url_content_as_markdownを使用する
+- ファイルを作成する時は末尾に改行を入れること。
