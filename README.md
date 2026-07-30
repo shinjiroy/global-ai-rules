@@ -18,4 +18,6 @@ PCを買い替えたり、会社用のPCにも同じルールを追加する時�
 cp -r claude_code/skills/. ~/.claude/skills/
 ```
 
+- `agent-orchestration` — 実装やレビューをサブエージェント(別モデル)へ委任する際のモデル割り当てと回し方
+- `cursor-agent` — cursor-agent(Cursor CLI)を非対話で実行して調査や実装を委譲する。前提ゲート・安全域の選択・stream-json の読み方・失敗検出を扱う
 - `goal-authoring` — 計画セッションで実行可能なGOAL.mdと検証コードを作り、別セッションで `/goal` に食わせて回す2フェーズ運用の、計画フェーズを支援する
