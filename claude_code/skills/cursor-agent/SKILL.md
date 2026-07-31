@@ -92,10 +92,12 @@ Never substitute your own implementation for a delegation that did not happen.
 1. **In an untrusted directory nothing runs at all.** It exits 1 and emits no `result` event. `--trust` is needed only on the first run in a given directory — the decision persists — but keep it in scripts regardless.
 2. **Always check `is_error`.** The exit code only catches startup failures (untrusted directory, invalid model → 1). Whether the agent's actual work failed appears only in the `result` event's `is_error`.
 3. **In plan mode the plan body never reaches `result`.** It exists only inside `createPlanToolCall.args.plan`, so `text` and `json` output drop it entirely.
-4. **`.cursor/rules` files scoped with `globs:` never activate.** They stay unloaded even when the matching file is read. Rules that must apply to CLI runs belong in `alwaysApply: true` or `AGENTS.md`.
+4. **`globs:`-scoped `.cursor/rules` load, but not dependably.** Across five otherwise identical runs one silently failed to attach, and when two rules declared the same glob only one of them ever attached. A rule the delegate must obey belongs in `alwaysApply: true` or `AGENTS.md`, which load on every run — or state it directly in the prompt.
 5. **`~/.claude/skills` is loaded.** Global skills and instruction files written for other agents leak into every cursor-agent run — a delegate will happily propose tooling, conventions, or an output language that the target repository shows no trace of. Mitigate at dispatch time: state the repository's actual state in the prompt ("no package.json, no test runner, no linter") and tell the delegate to propose nothing the repo does not already use. Suspect this first when the delegate behaves strangely.
 
 Loaded automatically: `AGENTS.md`, `CLAUDE.md`, `.cursor/rules` with `alwaysApply`, and the skills directories. Slash commands in `.cursor/commands/*.md` work under `-p` (`-p "/command-name"`).
+
+An `@other-file.md` reference inside a rule or `AGENTS.md` is **not** expanded up front — the delegate resolves it by reading that file with a tool. A rule that is only a pointer therefore costs an extra read and is skipped entirely when the delegate has no reason to follow it. Inline what must not be missed.
 
 ## Reading the result
 
