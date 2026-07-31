@@ -115,5 +115,7 @@ while IFS= read -r rule; do
 done < <(find "$rules_dir" -name '*.mdc' | sort)
 
 if [ -n "$collected" ]; then
-  printf '## Repository rules that apply to the files above\n\n%s\n' "${collected%$'\n\n'}"
+  # Leading blank line: the output is appended to an existing prompt, and a heading
+  # glued to the previous paragraph is not parsed as a heading.
+  printf '\n## Repository rules that apply to the files above\n\n%s\n' "${collected%$'\n\n'}"
 fi
