@@ -1,7 +1,7 @@
 ---
 name: cursor-agent
 description: Run cursor-agent (Cursor CLI) non-interactively to delegate investigation or implementation work. Use whenever the task is to drive Cursor from the command line — "have Cursor implement this", "run it through cursor-agent", "delegate to the Cursor CLI", "let Cursor plan it in plan mode". 日本語でも発動する: 「Cursorに実装させて」「cursor-agentで回して」「CursorをCLIで叩いて」「Cursorに委譲して」「plan modeで調べさせて」。Covers the preflight gate that must pass before any delegation, building the command, choosing a safety envelope (plan mode / sandbox), reading stream-json output, detecting failures, and resuming sessions. Not for driving the Cursor editor by hand, and not for orchestrating the host agent's own subagents.
-allowed-tools: Bash(cursor-agent:*), Bash(jq:*), Bash(mktemp:*), Bash(command:*), Bash(grep:*), Bash(tee:*), Bash(git:*), Read, Write
+allowed-tools: Bash(cursor-agent:*), Bash(jq:*), Bash(mktemp:*), Bash(command:*), Bash(grep:*), Bash(tee:*), Bash(git:*), Bash(${CLAUDE_SKILL_DIR}/scripts/collect-rules.py:*), Read, Write
 model: sonnet
 effort: low
 ---
@@ -140,3 +140,14 @@ Write it to `<RUN>/prompt.md` first (the run-scoped scratch dir from "Basic invo
 - Leave no decisions open — settle any remaining choice before dispatching
 - Inventory the repository yourself, then state what it actually has and lacks ("no package.json, no test runner, no linter") and forbid proposing anything it does not already use — this is the dispatch-time mitigation for pitfall 5
 - Pin the output language explicitly; global instruction files otherwise decide it for you
+- Inline the repository rules that govern the paths you named (below), so they cannot silently go missing
+
+### Inline the applicable repository rules
+
+`globs:`-scoped rules reach the delegate unreliably and `@` references are not expanded (pitfall 4). Append the rule text to the prompt instead of trusting either mechanism:
+
+```bash
+${CLAUDE_SKILL_DIR}/scripts/collect-rules.py <target repo> <path> [<path> ...] >> <RUN>/prompt.md
+```
+
+Pass the same paths the prompt names. The script prints every `.cursor/rules/*.mdc` whose globs match, with `@` references resolved inline, and prints nothing when the repository has no rules or none apply. Rules marked `alwaysApply: true` are skipped because cursor-agent already loads them on every run; pass `--include-always` only when you want to see everything for debugging.
