@@ -1,6 +1,6 @@
 ---
 name: cursor-agent
-description: Run cursor-agent (Cursor CLI) non-interactively to delegate investigation or implementation work. Use whenever the task is to drive Cursor from the command line — "have Cursor implement this", "run it through cursor-agent", "delegate to the Cursor CLI", "let Cursor plan it in plan mode". 日本語でも発動する: 「Cursorに実装させて」「cursor-agentで回して」「CursorをCLIで叩いて」「Cursorに委譲して」「plan modeで調べさせて」。Covers the preflight gate that must pass before any delegation, building the command, choosing a safety envelope (plan mode / sandbox), reading stream-json output, detecting failures, and resuming sessions. Not for driving the Cursor editor by hand, and not for orchestrating the host agent's own subagents.
+description: Run cursor-agent (Cursor CLI) non-interactively to delegate investigation or implementation work. Use whenever the task is to drive Cursor from the command line — "have Cursor implement this", "run it through cursor-agent", "delegate to the Cursor CLI", "let Cursor plan it in plan mode". 日本語でも発動する: 「Cursorに実装させて」「cursor-agentで回して」「CursorをCLIで叩いて」「Cursorに委譲して」「plan modeで調べさせて」。Covers the preflight gate that must pass before any delegation, building the command, choosing a safety envelope (plan mode / sandbox), inlining the repository rules that govern the files being changed, reading stream-json output, detecting failures, and resuming sessions. Not for driving the Cursor editor by hand, and not for orchestrating the host agent's own subagents.
 allowed-tools: Bash(cursor-agent:*), Bash(jq:*), Bash(command:*), Bash(grep:*), Bash(tee:*), Bash(git:*), Bash(${CLAUDE_SKILL_DIR}/scripts/new-run.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/collect-rules.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/summarize-run.sh:*), Read, Write
 model: sonnet
 effort: low
@@ -30,7 +30,36 @@ Match on the output, not the exit status: `cursor-agent status` exits 0 even whe
 
 Both are the user's decision to make: installing software and authenticating an account are not steps to take unattended. Report which check failed and what the user should run, then end your turn — do not block waiting for input.
 
+## Choose a safety envelope
+
+Decide this explicitly before dispatching work.
+
+| Goal | Extra flags | Blocked for the delegate | Still permitted for the delegate |
+| --- | --- | --- | --- |
+| Investigate / plan only | `--mode plan --sandbox enabled` | Editing files; network; writing outside the workspace | Reading everything; writing inside its own scratch space |
+| Real implementation | (none) | Nothing | Any file in the workspace, shell, network. Requires a clean working tree |
+
+Restrictions bind the delegate process only, never your own shell.
+
+`--mode plan` alone still permits writes to `/tmp`. Pair it with `--sandbox enabled` when read-only actually matters. Your own commands are unaffected — teeing the log to a scratch dir outside the repo works, and the run still reaches the model over the network.
+
+Neither flag stops a delegate from creating a **new** file inside the workspace in an implementation run. When the user asked for no new files at all, say so in the prompt; the envelope will not enforce it.
+
+Before an implementation run, check the tree: **dirty := `git -C <target repo> status --porcelain` produces any output, untracked files included.** If it is dirty on arrival, take the abort path. Do not stash or revert it — afterwards you would have no way to separate the delegate's changes from the pre-existing ones, and the `git diff` verification becomes meaningless.
+
+## Aborting
+
+Three conditions stop the procedure: `NOT_INSTALLED`, `NOT_LOGGED_IN`, and — before an implementation run — any output at all from `git -C <target repo> status --porcelain`, untracked files included. The tree rule is unconditional: no exemption for a small task or a single stray file. Every one of them ends the same way — report all three of the following, then end your turn without blocking for input:
+
+1. Which check failed, with the evidence you observed
+2. The exact action that unblocks it — `curl https://cursor.com/install -fsS | bash`, `cursor-agent login`, or the user's decision on the pre-existing changes
+3. That the delegated work was not done by any other means
+
+Never substitute your own implementation for a delegation that did not happen.
+
 ## Basic invocation
+
+Reach this section only after the preflight gate passed and, for an implementation run, the working tree came up clean. Everything below has side effects or costs money; the gates above do not.
 
 Two invariants, whatever mechanism you use to satisfy them:
 
@@ -58,7 +87,7 @@ It seeds `<RUN>/prompt.md` from `assets/prompt-template.md`. Everything one dele
 
 Nothing deletes these; leave them for the OS to reap. The log is the only evidence of what happened, and it is worth more after the turn than the few tens of KB it costs.
 
-**2. Fill in `<RUN>/prompt.md`.** Replace every `<...>` placeholder in the seeded template; see "Writing the prompt".
+**2. Fill in `<RUN>/prompt.md`.** Replace every `{{...}}` placeholder in the seeded template; see "Writing the prompt".
 
 **3. Invoke, naming the target repository with `--workspace`.**
 
@@ -77,29 +106,6 @@ cursor-agent -p --trust --workspace <target repo> <envelope flags> --output-form
 - Default to `--output-format stream-json`. With `text` or `json` you lose tool activity and the plan body
 - Do **not** pass `--model`. Respect the user's default in `~/.cursor/cli-config.json`. Override only with a reason, after checking `cursor-agent models`
 - `--force` / `--yolo` are unnecessary: `-p` already grants file writes and shell access
-
-## Choose a safety envelope
-
-Decide this explicitly before dispatching work.
-
-| Goal | Extra flags | Effect (all restrictions apply to the delegate process, never to your own shell) |
-| --- | --- | --- |
-| Investigate / plan only | `--mode plan --sandbox enabled` | The delegate makes no edits; its shell gets no network and cannot write outside the workspace |
-| Real implementation | (none) | The delegate edits the workspace directly. Requires a clean working tree |
-
-`--mode plan` alone still permits writes to `/tmp`. Pair it with `--sandbox enabled` when read-only actually matters. Your own commands are unaffected — teeing the log to a scratch dir outside the repo works, and the run still reaches the model over the network.
-
-Before an implementation run, check the tree: **dirty := `git -C <target repo> status --porcelain` produces any output, untracked files included.** If it is dirty on arrival, take the abort path. Do not stash or revert it — afterwards you would have no way to separate the delegate's changes from the pre-existing ones, and the `git diff` verification becomes meaningless.
-
-## Aborting
-
-Three conditions stop the procedure: `NOT_INSTALLED`, `NOT_LOGGED_IN`, and a dirty tree before an implementation run. Every one of them ends the same way — report all three of the following, then end your turn without blocking for input:
-
-1. Which check failed, with the evidence you observed
-2. The exact action that unblocks it — `curl https://cursor.com/install -fsS | bash`, `cursor-agent login`, or the user's decision on the pre-existing changes
-3. That the delegated work was not done by any other means
-
-Never substitute your own implementation for a delegation that did not happen.
 
 ## Pitfalls (measured; absent from `--help`)
 
@@ -129,6 +135,8 @@ It prints `is_error`, token usage, the session id needed for `--resume`, the pla
 
 `is_error=false` means the agent terminated normally — **not** that the work is correct. After delegating an implementation, verify with `git -C <target repo> status`, `git -C <target repo> diff`, and the repository's own tests. If the repository has no test runner, exercise the changed code directly from the scratch dir (a throwaway script under `<RUN>/`, never a file inside the repo) — an unverified diff is not a finished delegation.
 
+Check two separate things. **Is the diff right** — read it. **Did anything else move** — the paths in `git status` must be exactly the ones the prompt named, nothing more. A delegate with write access can leave a stray file behind while still producing a correct diff.
+
 Judge the delegate by its **artifacts** — the diff, the plan body, the files — never by its closing prose. The narration is where leaked global conventions surface (pitfall 5), so it can contradict the prompt even when the artifact obeys it.
 
 ## Resuming
@@ -152,7 +160,8 @@ Write it to `<RUN>/prompt.md` first (the run-scoped scratch dir from "Basic invo
 - Leave no decisions open — settle any remaining choice before dispatching
 - Inventory the repository yourself, then state what it actually has and lacks ("no package.json, no test runner, no linter") and forbid proposing anything it does not already use — this is the dispatch-time mitigation for pitfall 5
 - Pin the output language explicitly; global instruction files otherwise decide it for you
-- Inline the repository rules that govern the paths you named (below), so they cannot silently go missing
+- Inline the repository rules that govern the paths you named — use `collect-rules.sh` for this (next subsection); do not paste them by hand
+- Say which wins when the written rules contradict the code already there. Repositories drift, so a rule like "snake_case" can collide with existing camelCase neighbours. State the resolution — usually "new code follows the rules; existing code stays untouched" — rather than leaving the delegate to guess
 
 ### Inline the applicable repository rules
 
