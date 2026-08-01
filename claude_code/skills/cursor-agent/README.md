@@ -23,6 +23,7 @@ cursor-agent/
 ├── assets/
 │   └── prompt-template.md    skeleton for the delegated task
 └── scripts/
+    ├── preflight.sh          check everything that can abort, before anything expensive
     ├── new-run.sh            create a scratch dir for one delegation
     ├── collect-rules.sh      collect the .cursor/rules that apply to given paths
     └── summarize-run.sh      report a run's outcome; exit code carries the verdict

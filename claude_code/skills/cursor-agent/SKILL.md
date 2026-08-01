@@ -1,7 +1,7 @@
 ---
 name: cursor-agent
 description: Run cursor-agent (Cursor CLI) non-interactively to delegate investigation or implementation work. Use whenever the task is to drive Cursor from the command line — "have Cursor implement this", "run it through cursor-agent", "delegate to the Cursor CLI", "let Cursor plan it in plan mode". 日本語でも発動する: 「Cursorに実装させて」「cursor-agentで回して」「CursorをCLIで叩いて」「Cursorに委譲して」「plan modeで調べさせて」。Covers the preflight gate that must pass before any delegation, building the command, choosing a safety envelope (plan mode / sandbox), inlining the repository rules that govern the files being changed, reading stream-json output, detecting failures, and resuming sessions. Not for driving the Cursor editor by hand, and not for orchestrating the host agent's own subagents.
-allowed-tools: Bash(cursor-agent:*), Bash(jq:*), Bash(command:*), Bash(grep:*), Bash(tee:*), Bash(git:*), Bash(${CLAUDE_SKILL_DIR}/scripts/new-run.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/collect-rules.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/summarize-run.sh:*), Read, Write
+allowed-tools: Bash(cursor-agent:*), Bash(jq:*), Bash(git:*), Bash(tee:*), Bash(${CLAUDE_SKILL_DIR}/scripts/preflight.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/new-run.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/collect-rules.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/summarize-run.sh:*), Read, Write
 model: sonnet
 effort: low
 ---
@@ -17,13 +17,19 @@ Needs `bash`, `jq`, `git`, and the usual POSIX tools. `${CLAUDE_SKILL_DIR}` in t
 Run this once per session, before the first invocation. **It is a hard gate: if it fails, stop and report — do not attempt the delegated work by other means, and do not install or authenticate on the user's behalf.**
 
 ```bash
-command -v cursor-agent >/dev/null || { echo "NOT_INSTALLED: not on PATH"; exit 1; }
-STATUS=$(cursor-agent status 2>&1)
-grep -q "Logged in" <<<"$STATUS" || { echo "NOT_LOGGED_IN: $STATUS"; exit 1; }
-echo "GATE_OK: $(command -v cursor-agent) / $STATUS"
+${CLAUDE_SKILL_DIR}/scripts/preflight.sh <target repo> --implementation   # drop both arguments for a plan-only run
 ```
 
-Match on the output, not the exit status: `cursor-agent status` exits 0 even when logged out. The gate carries its own evidence (path, raw status text) so a failure can be reported to the user without a second diagnostic round.
+| Exit | Meaning |
+| --- | --- |
+| 0 | Ready to delegate |
+| 1 | `cursor-agent` not on PATH |
+| 2 | Not logged in |
+| 3 | The working tree already carries changes |
+
+It matches on output rather than exit status — `cursor-agent status` exits 0 even when logged out — and prints the evidence a failure report needs (binary path, raw status text, the dirty paths), so no second diagnostic round is necessary.
+
+**A caller that is about to spawn a delegation can run this script by itself first.** It needs no context beyond the path, and an abort costs a couple of commands instead of a whole delegation turn. Whoever performs the delegation runs it again — the tree can change in between.
 
 - `NOT_INSTALLED` — tell the user to install it: `curl https://cursor.com/install -fsS | bash` (lands in `~/.local/bin/cursor-agent`, which must be on `PATH`). Then stop.
 - `NOT_LOGGED_IN` — tell the user to run `cursor-agent login`. It opens a browser, so it cannot be done for them, and it cannot be done from a non-interactive session. Then stop.
@@ -138,6 +144,8 @@ It prints `is_error`, token usage, the session id needed for `--resume`, the pla
 Check two separate things. **Is the diff right** — read it. **Did anything else move** — the paths in `git status` must be exactly the ones the prompt named, nothing more. A delegate with write access can leave a stray file behind while still producing a correct diff.
 
 Judge the delegate by its **artifacts** — the diff, the plan body, the files — never by its closing prose. The narration is where leaked global conventions surface (pitfall 5), so it can contradict the prompt even when the artifact obeys it.
+
+When reporting back, **relay the delegate's closing message verbatim** rather than rewriting it. It is already on disk, `summarize-run.sh` prints it, and the account of the change belongs to whoever made it. Keep your own verdict separate and short: what `is_error` said, what `git diff` showed, whether the check passed. Paraphrasing the delegate costs tokens and quietly launders an unverified claim into your own voice.
 
 ## Resuming
 
