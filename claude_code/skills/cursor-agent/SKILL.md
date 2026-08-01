@@ -1,7 +1,7 @@
 ---
 name: cursor-agent
 description: Run cursor-agent (Cursor CLI) non-interactively to delegate investigation or implementation work. Use whenever the task is to drive Cursor from the command line — "have Cursor implement this", "run it through cursor-agent", "delegate to the Cursor CLI", "let Cursor plan it in plan mode". 日本語でも発動する: 「Cursorに実装させて」「cursor-agentで回して」「CursorをCLIで叩いて」「Cursorに委譲して」「plan modeで調べさせて」。Covers the preflight gate that must pass before any delegation, building the command, choosing a safety envelope (plan mode / sandbox), reading stream-json output, detecting failures, and resuming sessions. Not for driving the Cursor editor by hand, and not for orchestrating the host agent's own subagents.
-allowed-tools: Bash(cursor-agent:*), Bash(jq:*), Bash(mktemp:*), Bash(command:*), Bash(grep:*), Bash(tee:*), Bash(git:*), Bash(${CLAUDE_SKILL_DIR}/scripts/collect-rules.sh:*), Read, Write
+allowed-tools: Bash(cursor-agent:*), Bash(jq:*), Bash(command:*), Bash(grep:*), Bash(tee:*), Bash(git:*), Bash(${CLAUDE_SKILL_DIR}/scripts/new-run.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/collect-rules.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/summarize-run.sh:*), Read, Write
 model: sonnet
 effort: low
 ---
@@ -40,11 +40,23 @@ Assume every shell command runs in a **fresh process** — cwd resets and variab
 **1. Create the scratch dir and read the path off the output.**
 
 ```bash
-mktemp -d /tmp/ca-run-XXXXXX
+${CLAUDE_SKILL_DIR}/scripts/new-run.sh
 # -> /tmp/ca-run-Ab12Cd        substitute this literal path for <RUN> below
 ```
 
-**2. Write the delegated task to `<RUN>/prompt.md`.** A heredoc works; so does whatever file-writing tool your harness gives you. Content is covered in "Writing the prompt".
+It seeds `<RUN>/prompt.md` from `assets/prompt-template.md`. Everything one delegation produces stays in that directory:
+
+| File | Contents |
+| --- | --- |
+| `prompt.md` | The delegated task, plus the repository rules appended to it |
+| `ca.ndjson` | The complete stream log — the authority for every judgment about the run |
+| `followup-N.md` | The Nth `--resume` prompt |
+| `ca-followup-N.ndjson` | Its log. Numbered, so a follow-up never overwrites the first log |
+| `check.*` | A throwaway script used to exercise the change when the repo has no test runner |
+
+Nothing deletes these; leave them for the OS to reap. The log is the only evidence of what happened, and it is worth more after the turn than the few tens of KB it costs.
+
+**2. Fill in `<RUN>/prompt.md`.** Replace every `<...>` placeholder in the seeded template; see "Writing the prompt".
 
 **3. Invoke, naming the target repository with `--workspace`.**
 
@@ -102,19 +114,16 @@ An `@other-file.md` reference inside a rule or `AGENTS.md` is **not** expanded u
 ## Reading the result
 
 ```bash
-# Did it run at all? (0 means it never started — untrusted directory, etc.)
-grep -c '"type":"result"' <RUN>/ca.ndjson
-
-# Outcome and final message
-jq -r 'select(.type=="result") | "is_error=\(.is_error)\ntokens=\(.usage.inputTokens)/\(.usage.outputTokens)\n\n\(.result)"' <RUN>/ca.ndjson
-
-# Session id (needed to resume)
-jq -r 'select(.type=="result") | .session_id' <RUN>/ca.ndjson
-
-# Plan body in plan mode (recovers pitfall 3; emitted twice, so keep only "completed")
-jq -r 'select(.type=="tool_call" and .subtype=="completed" and (.tool_call.createPlanToolCall != null))
-       | .tool_call.createPlanToolCall.args.plan' <RUN>/ca.ndjson
+${CLAUDE_SKILL_DIR}/scripts/summarize-run.sh <RUN>/ca.ndjson
 ```
+
+It prints `is_error`, token usage, the session id needed for `--resume`, the plan body when the run was in plan mode (pitfall 3), and the final message. Its exit status carries the verdict:
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | The run completed with `is_error=false` |
+| 1 | No `result` event — the run never started (untrusted directory, bad flags) |
+| 2 | The run reported `is_error=true` |
 
 `is_error=false` means the agent terminated normally — **not** that the work is correct. After delegating an implementation, verify with `git -C <target repo> status`, `git -C <target repo> diff`, and the repository's own tests. If the repository has no test runner, exercise the changed code directly from the scratch dir (a throwaway script under `<RUN>/`, never a file inside the repo) — an unverified diff is not a finished delegation.
 
@@ -125,7 +134,8 @@ Judge the delegate by its **artifacts** — the diff, the plan body, the files �
 To continue rather than redo, resume instead of starting fresh: the cached context cuts input tokens dramatically.
 
 ```bash
-cursor-agent --resume <session_id> -p --trust --workspace <target repo> --output-format stream-json < <RUN>/followup.md
+cursor-agent --resume <session_id> -p --trust --workspace <target repo> --output-format stream-json \
+  < <RUN>/followup-1.md | tee <RUN>/ca-followup-1.ndjson
 ```
 
 `--continue` resumes the most recent session. The interactive pickers (`cursor-agent ls`, `cursor-agent resume`) **fail outside a TTY** with a raw-mode error, so keep track of the session id yourself.
