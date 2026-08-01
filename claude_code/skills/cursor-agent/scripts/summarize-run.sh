@@ -11,6 +11,7 @@
 set -euo pipefail
 
 [ $# -eq 1 ] || { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+command -v jq >/dev/null || { echo "jq is required: https://jqlang.github.io/jq/" >&2; exit 64; }
 log=$1
 [ -f "$log" ] || { echo "no such log: $log" >&2; exit 64; }
 

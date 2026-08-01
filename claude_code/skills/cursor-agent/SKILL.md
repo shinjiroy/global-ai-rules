@@ -10,6 +10,8 @@ effort: low
 
 `cursor-agent` is expensive per run, has real side effects, and signals failure in its output stream rather than in its exit code. The full flag list is in `cursor-agent --help`; this skill covers only the measured behavior that `--help` does not tell you, plus the procedure around it.
 
+Needs `bash`, `jq`, `git`, and the usual POSIX tools. `${CLAUDE_SKILL_DIR}` in the commands below is Claude Code's substitution for this skill's own directory; on a host that does not provide it, use the directory holding this file.
+
 ## Preflight gate
 
 Run this once per session, before the first invocation. **It is a hard gate: if it fails, stop and report — do not attempt the delegated work by other means, and do not install or authenticate on the user's behalf.**

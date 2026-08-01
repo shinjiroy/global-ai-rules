@@ -10,7 +10,7 @@ set -euo pipefail
 
 template="$(cd "$(dirname "${BASH_SOURCE[0]}")/../assets" && pwd)/prompt-template.md"
 
-run=$(mktemp -d /tmp/ca-run-XXXXXX)
+run=$(mktemp -d "${TMPDIR:-/tmp}/ca-run-XXXXXX")   # macOS points TMPDIR at a per-user directory
 if [ -f "$template" ]; then
   cp "$template" "$run/prompt.md"
 else
