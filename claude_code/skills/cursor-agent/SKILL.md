@@ -10,6 +10,8 @@ effort: low
 
 `cursor-agent` is expensive per run, has real side effects, and signals failure in its output stream rather than in its exit code. The full flag list is in `cursor-agent --help`; this skill covers only the measured behavior that `--help` does not tell you, plus the procedure around it.
 
+Whether you run this yourself or inside a subagent you spawned is the caller's decision — this skill works the same either way and does not ask for one shape. Everything below is written for whoever performs the delegation.
+
 Needs `bash`, `jq`, `git`, and the usual POSIX tools. `${CLAUDE_SKILL_DIR}` in the commands below is Claude Code's substitution for this skill's own directory; on a host that does not provide it, use the directory holding this file.
 
 ## Preflight gate
@@ -29,7 +31,7 @@ ${CLAUDE_SKILL_DIR}/scripts/preflight.sh <target repo> --implementation   # drop
 
 It matches on output rather than exit status — `cursor-agent status` exits 0 even when logged out — and prints the evidence a failure report needs (binary path, raw status text, the dirty paths), so no second diagnostic round is necessary.
 
-**A caller that is about to spawn a delegation can run this script by itself first.** It needs no context beyond the path, and an abort costs a couple of commands instead of a whole delegation turn. Whoever performs the delegation runs it again — the tree can change in between.
+Optional, when the delegation runs in a spawned subagent: whoever is about to spawn it can run this script first. It needs no context beyond the path, so an abort costs two commands instead of a whole subagent turn. That is a caller-side optimization, not part of this procedure — the subagent still runs the gate itself, because the tree can change in between.
 
 - `NOT_INSTALLED` — tell the user to install it: `curl https://cursor.com/install -fsS | bash` (lands in `~/.local/bin/cursor-agent`, which must be on `PATH`). Then stop.
 - `NOT_LOGGED_IN` — tell the user to run `cursor-agent login`. It opens a browser, so it cannot be done for them, and it cannot be done from a non-interactive session. Then stop.
