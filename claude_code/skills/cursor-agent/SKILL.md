@@ -55,9 +55,11 @@ Neither flag stops a delegate from creating a **new** file inside the workspace 
 
 Before an implementation run, check the tree: **dirty := `git -C <target repo> status --porcelain` produces any output, untracked files included.** If it is dirty on arrival, take the abort path. Do not stash or revert it — afterwards you would have no way to separate the delegate's changes from the pre-existing ones, and the `git diff` verification becomes meaningless.
 
+One case is not an arrival: a run that was **cut off mid-work** leaves the delegate's own unfinished changes behind. Resuming that session is the continuation of a delegation already in progress, not a new one — see "Resuming an interrupted run".
+
 ## Aborting
 
-Three conditions stop the procedure: `NOT_INSTALLED`, `NOT_LOGGED_IN`, and — before an implementation run — any output at all from `git -C <target repo> status --porcelain`, untracked files included. The tree rule is unconditional: no exemption for a small task or a single stray file. Every one of them ends the same way — report all three of the following, then end your turn without blocking for input:
+Three conditions stop the procedure: `NOT_INSTALLED`, `NOT_LOGGED_IN`, and — before an implementation run — any output at all from `git -C <target repo> status --porcelain`, untracked files included. The tree rule admits exactly one exception, the interrupted run above, and it has to be established from that run's log rather than assumed; there is none for a small task or a single stray file. Every one of them ends the same way — report all three of the following, then end your turn without blocking for input:
 
 1. Which check failed, with the evidence you observed
 2. The exact action that unblocks it — `curl https://cursor.com/install -fsS | bash`, `cursor-agent login`, or the user's decision on the pre-existing changes
@@ -115,6 +117,28 @@ cursor-agent -p --trust --workspace <target repo> <envelope flags> --output-form
 - Do **not** pass `--model`. Respect the user's default in `~/.cursor/cli-config.json`. Override only with a reason, after checking `cursor-agent models`
 - `--force` / `--yolo` are unnecessary: `-p` already grants file writes and shell access
 
+### Keep the run alive to its own end
+
+A run takes minutes to tens of minutes and dies with whatever shell started it. If your turn — or the sub-agent you are running as — can end before the pipeline returns, the delegate is killed **mid-edit**: the session is resumable, but the workspace is left holding half-finished, uncommitted work. Two ways to avoid it, in order of preference:
+
+1. **Return only after the process exits.** Run the pipeline in the foreground of a call that you wait on.
+2. **Detach it from your process group** when the host insists on backgrounding, so ending your turn does not take the run with it:
+
+   ```bash
+   setsid nohup cursor-agent -p --trust --workspace <target repo> --output-format stream-json \
+     < <RUN>/prompt.md > <RUN>/ca.ndjson 2>&1 &
+   ```
+
+   The live `jq` view is lost — read `<RUN>/ca.ndjson` instead — but the run finishes on its own. `setsid` is Linux; where it is absent, use whatever detaches a process on that host.
+
+When you poll for completion, do not match your own waiting command. `pgrep -f cursor-agent` matches the shell that contains that very string, so the loop never ends. Break the self-match with a character class:
+
+```bash
+while pgrep -f "[c]ursor-agent" >/dev/null; do sleep 30; done
+```
+
+A run is finished when the process is gone **and** `<RUN>/ca.ndjson` ends with a `result` event. A log whose last event is anything else is a run that was cut off, not one that failed.
+
 ## Pitfalls (measured; absent from `--help`)
 
 1. **In an untrusted directory nothing runs at all.** It exits 1 and emits no `result` event. `--trust` is needed only on the first run in a given directory — the decision persists — but keep it in scripts regardless.
@@ -159,6 +183,12 @@ cursor-agent --resume <session_id> -p --trust --workspace <target repo> --output
 ```
 
 `--continue` resumes the most recent session. The interactive pickers (`cursor-agent ls`, `cursor-agent resume`) **fail outside a TTY** with a raw-mode error, so keep track of the session id yourself.
+
+### Resuming an interrupted run
+
+When a run was killed before its `result` event, the workspace holds the delegate's own half-finished work. Confirm that provenance from `<RUN>/ca.ndjson` — the edits it logged should account for the paths `git status` now shows — and then resume that session with the dirty tree left exactly as it is.
+
+Say so in the follow-up prompt: the uncommitted changes are its own work in progress, it should read the current diff first and continue from there, and it must not stash or revert them. Without that, a delegate that finds an unexpectedly dirty tree may try to clean it up. Verification afterwards is unchanged, since the base commit you recorded still predates everything the delegation produced.
 
 ## Writing the prompt
 
