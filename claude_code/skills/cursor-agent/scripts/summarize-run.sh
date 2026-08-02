@@ -6,8 +6,9 @@
 #
 # Prints the outcome, token usage, session id (needed for --resume), the final
 # message, and — in plan mode — the plan body, which never reaches the `result`
-# event. Exits 1 when the log holds no `result` event, meaning the run never
-# started (untrusted directory, bad flags), and 2 when it reports is_error.
+# event. Exits 1 when the log holds no `result` event and no work either, meaning
+# the run never started (untrusted directory, bad flags), 2 when it reports
+# is_error, and 4 when the run was cut off after it had begun working.
 set -euo pipefail
 
 [ $# -eq 1 ] || { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
@@ -16,6 +17,14 @@ log=$1
 [ -f "$log" ] || { echo "no such log: $log" >&2; exit 64; }
 
 if ! grep -q '"type":"result"' "$log"; then
+  # Work in the log without a result event means the run was killed mid-flight,
+  # not that it failed to start. Its session id is on every event, so --resume
+  # still works from here.
+  if grep -qE '"type":"(assistant|thinking|tool_call)"' "$log"; then
+    echo "INTERRUPTED: the run was cut off before its result event — resume it, do not restart" >&2
+    echo "session=$(head -1 "$log" | jq -r '.session_id // "unknown"')" >&2
+    exit 4
+  fi
   echo "NO_RESULT_EVENT: the run never started — check the invocation and workspace trust" >&2
   exit 1
 fi
