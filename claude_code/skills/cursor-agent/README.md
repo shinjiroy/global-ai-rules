@@ -12,8 +12,9 @@ An [Agent Skill](https://agentskills.io) for driving [`cursor-agent`](https://cu
 - Choosing a safety envelope — read-only (`--mode plan --sandbox enabled`) or a real implementation run
 - Reading `stream-json`, including the plan body that never reaches the `result` event
 - Judging success by `is_error`, not by the exit code
-- Resuming a session instead of paying for a fresh one
-- Five measured pitfalls that produce silent failures
+- Keeping a run alive past the turn that started it, and telling an interrupted run from a failed one
+- Resuming a session instead of paying for a fresh one, including one that was cut off mid-edit
+- Six measured pitfalls that produce silent failures
 
 ## Layout
 

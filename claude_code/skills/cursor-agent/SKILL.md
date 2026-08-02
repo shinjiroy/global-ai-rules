@@ -19,7 +19,7 @@ Needs `bash`, `jq`, `git`, and the usual POSIX tools. `${CLAUDE_SKILL_DIR}` in t
 Run this once per session, before the first invocation. **It is a hard gate: if it fails, stop and report — do not attempt the delegated work by other means, and do not install or authenticate on the user's behalf.**
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/preflight.sh <target repo> --implementation   # drop both arguments for a plan-only run
+${CLAUDE_SKILL_DIR}/scripts/preflight.sh <target repo> --implementation   # drop both arguments for a plan-only run, or when resuming an interrupted one
 ```
 
 | Exit | Meaning |
@@ -45,7 +45,7 @@ Decide this explicitly before dispatching work.
 | Goal | Extra flags | Blocked for the delegate | Still permitted for the delegate |
 | --- | --- | --- | --- |
 | Investigate / plan only | `--mode plan --sandbox enabled` | Editing files; network; writing outside the workspace | Reading everything; writing inside its own scratch space |
-| Real implementation | (none) | Nothing | Any file in the workspace, shell, network. Requires a clean working tree |
+| Real implementation | `--force` when the delegate must run commands | Shell commands, unless `--force` is passed (pitfall 5) | Any file in the workspace, network. Requires a clean working tree |
 
 Restrictions bind the delegate process only, never your own shell.
 
@@ -55,9 +55,11 @@ Neither flag stops a delegate from creating a **new** file inside the workspace 
 
 Before an implementation run, check the tree: **dirty := `git -C <target repo> status --porcelain` produces any output, untracked files included.** If it is dirty on arrival, take the abort path. Do not stash or revert it — afterwards you would have no way to separate the delegate's changes from the pre-existing ones, and the `git diff` verification becomes meaningless.
 
+One case is not an arrival: a run that was **cut off mid-work** leaves the delegate's own unfinished changes behind. Resuming that session is the continuation of a delegation already in progress, not a new one — see "Resuming an interrupted run".
+
 ## Aborting
 
-Three conditions stop the procedure: `NOT_INSTALLED`, `NOT_LOGGED_IN`, and — before an implementation run — any output at all from `git -C <target repo> status --porcelain`, untracked files included. The tree rule is unconditional: no exemption for a small task or a single stray file. Every one of them ends the same way — report all three of the following, then end your turn without blocking for input:
+Three conditions stop the procedure: `NOT_INSTALLED`, `NOT_LOGGED_IN`, and — before an implementation run — any output at all from `git -C <target repo> status --porcelain`, untracked files included. The tree rule admits exactly one exception, the interrupted run above, and it has to be established from that run's log rather than assumed; there is none for a small task or a single stray file. Every one of them ends the same way — report all three of the following, then end your turn without blocking for input:
 
 1. Which check failed, with the evidence you observed
 2. The exact action that unblocks it — `curl https://cursor.com/install -fsS | bash`, `cursor-agent login`, or the user's decision on the pre-existing changes
@@ -108,12 +110,41 @@ cursor-agent -p --trust --workspace <target repo> <envelope flags> --output-form
 `tee` writes the **complete** stream to `<RUN>/ca.ndjson` while `jq` shows live tool activity; the file — not the filtered console view — is the authoritative record every query in "Reading the result" runs against.
 
 - Target the repository with `--workspace`, never by prefixing `cd <repo> &&`. A compound command defeats the host's per-command permission matching, so every run re-prompts; `--workspace` keeps the invocation a single `cursor-agent` command. Every `git` command in this skill likewise uses `git -C <target repo>`
-- `<envelope flags>` comes from "Choose a safety envelope" below. Decide it before running; it is empty only for real implementation
+- `<envelope flags>` comes from "Choose a safety envelope" below. Decide it before running; it is empty only for an implementation run whose delegate needs no shell
 - **Do not read `$?` after this pipeline** — it belongs to `jq`, not to cursor-agent. Judge the outcome from `is_error` (pitfall 2)
 - `--trust` is required the first time you run in a directory (see pitfall 1)
 - Default to `--output-format stream-json`. With `text` or `json` you lose tool activity and the plan body
 - Do **not** pass `--model`. Respect the user's default in `~/.cursor/cli-config.json`. Override only with a reason, after checking `cursor-agent models`
-- `--force` / `--yolo` are unnecessary: `-p` already grants file writes and shell access
+- `-p` grants file writes but **not** shell commands. Add `--force` to an implementation run whose delegate has to run anything — the tests, `git`, a build (see pitfall 5). Leave it off in plan mode, where the sandbox is the point
+
+### Keep the run alive to its own end
+
+A run takes minutes to tens of minutes and dies with whatever shell started it. If your turn — or the sub-agent you are running as — can end before the pipeline returns, the delegate is killed **mid-edit**: the session is resumable, but the workspace is left holding half-finished, uncommitted work. Two ways to avoid it:
+
+1. **Return only after the process exits.** Run the pipeline in the foreground of a call that you wait on. This is the simpler shape, and it holds only while the run fits inside the host's per-command timeout — Claude Code's Bash tool allows at most ten minutes, which a large task will outlast. Raise the timeout to its maximum when you take this path, and take the second one when the task is bigger than that or the host backgrounds the call regardless.
+2. **Detach it from your process group**, so ending your turn does not take the run with it:
+
+   ```bash
+   setsid bash -c 'echo $$ > <RUN>/ca.pid; exec cursor-agent -p --trust --workspace <target repo> \
+     <envelope flags> --output-format stream-json \
+     < <RUN>/prompt.md > <RUN>/ca.ndjson 2> <RUN>/ca.err' &
+   ```
+
+   The live `jq` view is lost — read `<RUN>/ca.ndjson` instead — but the run finishes on its own. Three details are load-bearing:
+
+   - **The inner shell records its own `$$` and then `exec`s**, so the pid file holds the run itself. `echo $! > <RUN>/ca.pid` does not work here: `setsid` forks, so `$!` is a wrapper that exits immediately, and polling it reports the run as finished seconds after it started
+   - **stderr goes to its own file.** Merged into the log it breaks the NDJSON, and every `jq` query over the run then fails
+   - `setsid` is Linux; where it is absent, use whatever detaches a process on that host
+
+Poll that pid rather than the process name:
+
+```bash
+while kill -0 "$(cat <RUN>/ca.pid)" 2>/dev/null; do sleep 30; done
+```
+
+Matching on the name is worse in two ways. `pgrep -f cursor-agent` matches the shell running that very command, so the loop waits on itself forever; and even with the self-match broken by a character class (`pgrep -f "[c]ursor-agent"`), it still matches an unrelated concurrent delegation and waits for that one instead. Fall back to the character-class form only when the pid was not captured.
+
+A run is finished when the process is gone **and** `<RUN>/ca.ndjson` ends with a `result` event. A log whose last event is anything else is a run that was cut off, not one that failed — `summarize-run.sh` reports that case as `INTERRUPTED` (exit 4).
 
 ## Pitfalls (measured; absent from `--help`)
 
@@ -121,7 +152,8 @@ cursor-agent -p --trust --workspace <target repo> <envelope flags> --output-form
 2. **Always check `is_error`.** The exit code only catches startup failures (untrusted directory, invalid model → 1). Whether the agent's actual work failed appears only in the `result` event's `is_error`.
 3. **In plan mode the plan body never reaches `result`.** It exists only inside `createPlanToolCall.args.plan`, so `text` and `json` output drop it entirely.
 4. **`globs:`-scoped `.cursor/rules` load, but not dependably.** Across five otherwise identical runs one silently failed to attach, and when two rules declared the same glob only one of them ever attached. A rule the delegate must obey belongs in `alwaysApply: true` or `AGENTS.md`, which load on every run — or state it directly in the prompt.
-5. **`~/.claude/skills` is loaded.** Global skills and instruction files written for other agents leak into every cursor-agent run — a delegate will happily propose tooling, conventions, or an output language that the target repository shows no trace of. Mitigate at dispatch time: state the repository's actual state in the prompt ("no package.json, no test runner, no linter") and tell the delegate to propose nothing the repo does not already use. Suspect this first when the delegate behaves strangely.
+5. **Without `--force`, every shell command is rejected — and the delegate reports the output it never got.** Under `-p --trust` alone, each `shellToolCall` comes back `{"rejected": ...}` while file edits go through untouched. A delegate told to run the tests then writes a plausible passing transcript into its closing message: in a measured run it reported `Ran 40 tests ... OK` for a suite that in fact ended `FAILED (failures=1)`. Add `--force` when the delegate must execute anything, and read the outcome out of each `shellToolCall.result` rather than out of the prose: `rejected` means it never ran, `failure` means the command exited non-zero.
+6. **`~/.claude/skills` is loaded.** Global skills and instruction files written for other agents leak into every cursor-agent run — a delegate will happily propose tooling, conventions, or an output language that the target repository shows no trace of. Mitigate at dispatch time: state the repository's actual state in the prompt ("no package.json, no test runner, no linter") and tell the delegate to propose nothing the repo does not already use. Suspect this first when the delegate behaves strangely.
 
 Loaded automatically: `AGENTS.md`, `CLAUDE.md`, `.cursor/rules` with `alwaysApply`, and the skills directories. Slash commands in `.cursor/commands/*.md` work under `-p` (`-p "/command-name"`).
 
@@ -138,14 +170,15 @@ It prints `is_error`, token usage, the session id needed for `--resume`, the pla
 | Exit | Meaning |
 | --- | --- |
 | 0 | The run completed with `is_error=false` |
-| 1 | No `result` event — the run never started (untrusted directory, bad flags) |
+| 1 | No `result` event and no work in the log — the run never started (untrusted directory, bad flags) |
 | 2 | The run reported `is_error=true` |
+| 4 | The run worked, then was cut off before its `result` event — resume it, do not restart |
 
 `is_error=false` means the agent terminated normally — **not** that the work is correct. After delegating an implementation, verify with `git -C <target repo> status`, `git -C <target repo> diff`, and the repository's own tests. If the repository has no test runner, exercise the changed code directly from the scratch dir (a throwaway script under `<RUN>/`, never a file inside the repo) — an unverified diff is not a finished delegation.
 
-Check two separate things. **Is the diff right** — read it. **Did anything else move** — the paths in `git status` must be exactly the ones the prompt named, nothing more. A delegate with write access can leave a stray file behind while still producing a correct diff.
+Check two separate things. **Is the diff right** — read it. **Did anything else move** — the paths in `git status` must be exactly the ones the prompt named, nothing more. A delegate with write access can leave a stray file behind while still producing a correct diff. Under `--force` the tests themselves add to that list — a Python run leaves `__pycache__/` untracked — so account for build artifacts before treating an extra path as the delegate going off-script.
 
-Judge the delegate by its **artifacts** — the diff, the plan body, the files — never by its closing prose. The narration is where leaked global conventions surface (pitfall 5), so it can contradict the prompt even when the artifact obeys it.
+Judge the delegate by its **artifacts** — the diff, the plan body, the files — never by its closing prose. The narration is where leaked global conventions surface (pitfall 6), so it can contradict the prompt even when the artifact obeys it.
 
 When reporting back, **relay the delegate's closing message verbatim** rather than rewriting it. It is already on disk, `summarize-run.sh` prints it, and the account of the change belongs to whoever made it. Keep your own verdict separate and short: what `is_error` said, what `git diff` showed, whether the check passed. Paraphrasing the delegate costs tokens and quietly launders an unverified claim into your own voice.
 
@@ -160,6 +193,23 @@ cursor-agent --resume <session_id> -p --trust --workspace <target repo> --output
 
 `--continue` resumes the most recent session. The interactive pickers (`cursor-agent ls`, `cursor-agent resume`) **fail outside a TTY** with a raw-mode error, so keep track of the session id yourself.
 
+### Resuming an interrupted run
+
+When a run was killed before its `result` event, the workspace holds the delegate's own half-finished work. Confirm that provenance from `<RUN>/ca.ndjson` — the edits it logged should account for the paths `git status` now shows — and then resume that session with the dirty tree left exactly as it is.
+
+Two mechanics differ from a fresh delegation:
+
+- **Run the preflight gate without `--implementation`.** Only the install and login checks apply. The tree check would abort on the very changes you are resuming, and this is the one case where dirt is expected rather than disqualifying
+- **Take the session id off the log's first line**, since no `result` event exists for `summarize-run.sh` to read it from:
+
+  ```bash
+  head -1 <RUN>/ca.ndjson | jq -r .session_id
+  ```
+
+  Every event carries it, including the opening `system`/`init`. When the log is empty the run died before emitting anything: there is no id and no provenance to establish, so `--continue` — which resumes the most recent session — is the only route, and without a log to corroborate them the changes fall back under the ordinary dirty-tree abort.
+
+Say so in the follow-up prompt: the uncommitted changes are its own work in progress, it should read the current diff first and continue from there, and it must not stash or revert them. Without that, a delegate that finds an unexpectedly dirty tree may try to clean it up. Verification afterwards is unchanged, since the base commit you recorded still predates everything the delegation produced.
+
 ## Writing the prompt
 
 Write it to `<RUN>/prompt.md` first (the run-scoped scratch dir from "Basic invocation" — never inside the target repo). cursor-agent is strong on well-scoped execution and weaker on long exploration and open design decisions.
@@ -168,7 +218,7 @@ Write it to `<RUN>/prompt.md` first (the run-scoped scratch dir from "Basic invo
 - State completion conditions mechanically ("the tests pass", "this function exists in this file")
 - State what not to do (do not commit, do not touch other files)
 - Leave no decisions open — settle any remaining choice before dispatching
-- Inventory the repository yourself, then state what it actually has and lacks ("no package.json, no test runner, no linter") and forbid proposing anything it does not already use — this is the dispatch-time mitigation for pitfall 5
+- Inventory the repository yourself, then state what it actually has and lacks ("no package.json, no test runner, no linter") and forbid proposing anything it does not already use — this is the dispatch-time mitigation for pitfall 6
 - Pin the output language explicitly; global instruction files otherwise decide it for you
 - Inline the repository rules that govern the paths you named — use `collect-rules.sh` for this (next subsection); do not paste them by hand
 - Say which wins when the written rules contradict the code already there. Repositories drift, so a rule like "snake_case" can collide with existing camelCase neighbours. State the resolution — usually "new code follows the rules; existing code stays untouched" — rather than leaving the delegate to guess
