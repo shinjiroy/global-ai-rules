@@ -1,7 +1,7 @@
 ---
 name: cursor-agent
 description: Run cursor-agent (Cursor CLI) non-interactively to delegate investigation or implementation work. Use whenever the task is to drive Cursor from the command line — "have Cursor implement this", "run it through cursor-agent", "delegate to the Cursor CLI", "let Cursor plan it in plan mode". 日本語でも発動する: 「Cursorに実装させて」「cursor-agentで回して」「CursorをCLIで叩いて」「Cursorに委譲して」「plan modeで調べさせて」。Covers the preflight gate that must pass before any delegation, building the command, choosing a safety envelope (plan mode / sandbox), inlining the repository rules that govern the files being changed, reading stream-json output, detecting failures, and resuming sessions. Not for driving the Cursor editor by hand, and not for orchestrating the host agent's own subagents.
-allowed-tools: Bash(cursor-agent:*), Bash(jq:*), Bash(git:*), Bash(tee:*), Bash(${CLAUDE_SKILL_DIR}/scripts/preflight.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/new-run.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/collect-rules.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/summarize-run.sh:*), Read, Write
+allowed-tools: Bash(cursor-agent:*), Bash(jq:*), Bash(git:*), Bash(tee:*), Bash(${CLAUDE_SKILL_DIR}/scripts/preflight.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/new-run.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/collect-rules.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/await-run.sh:*), Bash(${CLAUDE_SKILL_DIR}/scripts/summarize-run.sh:*), Read, Write
 model: sonnet
 effort: low
 ---
@@ -91,6 +91,7 @@ It seeds `<RUN>/prompt.md` from `assets/prompt-template.md`. Everything one dele
 | --- | --- |
 | `prompt.md` | The delegated task, plus the repository rules appended to it |
 | `ca.ndjson` | The complete stream log — the authority for every judgment about the run |
+| `ca.pid`, `ca.err` | The detached run's pid and stderr, written by the invocation below |
 | `followup-N.md` | The Nth `--resume` prompt |
 | `ca-followup-N.ndjson` | Its log. Numbered, so a follow-up never overwrites the first log |
 | `check.*` | A throwaway script used to exercise the change when the repo has no test runner |
@@ -136,15 +137,25 @@ A run takes minutes to tens of minutes and dies with whatever shell started it. 
    - **stderr goes to its own file.** Merged into the log it breaks the NDJSON, and every `jq` query over the run then fails
    - `setsid` is Linux; where it is absent, use whatever detaches a process on that host
 
-Poll that pid rather than the process name:
+### Wait on the log, never on the process
 
 ```bash
-while kill -0 "$(cat <RUN>/ca.pid)" 2>/dev/null; do sleep 30; done
+${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson
 ```
 
-Matching on the name is worse in two ways. `pgrep -f cursor-agent` matches the shell running that very command, so the loop waits on itself forever; and even with the self-match broken by a character class (`pgrep -f "[c]ursor-agent"`), it still matches an unrelated concurrent delegation and waits for that one instead. Fall back to the character-class form only when the pid was not captured.
+**A run is over when `<RUN>/ca.ndjson` carries a `result` event.** Process liveness is not the signal: cursor-agent stays alive as long as it holds a foreground child it started — a dev server, a file watcher — so a loop like `while kill -0 "$(cat <RUN>/ca.pid)"; do sleep 30; done` blocks long after the delegate finished, with the completed result already sitting in the log (measured: 16 minutes). `await-run.sh` returns on the event, then kills the run's whole process group, which is what clears the leaked child.
 
-A run is finished when the process is gone **and** `<RUN>/ca.ndjson` ends with a `result` event. A log whose last event is anything else is a run that was cut off, not one that failed — `summarize-run.sh` reports that case as `INTERRUPTED` (exit 4).
+| Exit | Meaning |
+| --- | --- |
+| 0 | The `result` event arrived. Anything still running was killed; go read the result |
+| 3 | The log stopped growing for `--stall-seconds` (default 600) — read it before killing or resuming; this is the shape a genuine hang takes |
+| 4 | The process exited before its `result` event — cut off, not failed. Resume it |
+
+It reads `<RUN>/ca.pid` from beside the log; a follow-up run logging to `ca-followup-N.ndjson` needs `--pid-file`. Waiting is all the script does, so a call that hits the host's per-command timeout can just be repeated — nothing is lost and the log is unchanged.
+
+Never poll by process **name**. `pgrep -f cursor-agent` matches the shell running that very command and so waits on itself forever, and the character-class form (`pgrep -f "[c]ursor-agent"`) matches an unrelated concurrent delegation instead.
+
+A log whose last event is anything but `result` is a run that was cut off rather than one that failed; `summarize-run.sh` reports that case as `INTERRUPTED` (exit 4) as well.
 
 ## Pitfalls (measured; absent from `--help`)
 
