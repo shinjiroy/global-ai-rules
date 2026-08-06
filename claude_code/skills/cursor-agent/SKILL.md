@@ -100,7 +100,7 @@ Nothing deletes these; leave them for the OS to reap. The log is the only eviden
 
 **2. Fill in `<RUN>/prompt.md`.** Replace every `{{...}}` placeholder in the seeded template; see "Writing the prompt".
 
-**3. Invoke, naming the target repository with `--workspace`.**
+**3. Invoke, naming the target repository with `--workspace`.** These are the flags; the shape to actually run them in is the detached one under "Keep the run alive to its own end", which you should read before dispatching.
 
 ```bash
 cursor-agent -p --trust --workspace <target repo> <envelope flags> --output-format stream-json \
@@ -108,7 +108,7 @@ cursor-agent -p --trust --workspace <target repo> <envelope flags> --output-form
   | jq -r --unbuffered 'select(.type=="tool_call" and .subtype=="started") | .tool_call | to_entries[0].key'
 ```
 
-`tee` writes the **complete** stream to `<RUN>/ca.ndjson` while `jq` shows live tool activity; the file — not the filtered console view — is the authoritative record every query in "Reading the result" runs against.
+`tee` writes the **complete** stream to `<RUN>/ca.ndjson` while `jq` shows live tool activity; the file — not the filtered console view — is the authoritative record every query in "Reading the result" runs against. This piped form is for a short plan-mode run only: a delegate that can start a dev server will hang it (see the next section), so an implementation run redirects to the log instead.
 
 - Target the repository with `--workspace`, never by prefixing `cd <repo> &&`. A compound command defeats the host's per-command permission matching, so every run re-prompts; `--workspace` keeps the invocation a single `cursor-agent` command. Every `git` command in this skill likewise uses `git -C <target repo>`
 - `<envelope flags>` comes from "Choose a safety envelope" below. Decide it before running; it is empty only for an implementation run whose delegate needs no shell
@@ -120,22 +120,23 @@ cursor-agent -p --trust --workspace <target repo> <envelope flags> --output-form
 
 ### Keep the run alive to its own end
 
-A run takes minutes to tens of minutes and dies with whatever shell started it. If your turn — or the sub-agent you are running as — can end before the pipeline returns, the delegate is killed **mid-edit**: the session is resumable, but the workspace is left holding half-finished, uncommitted work. Two ways to avoid it:
+A run takes minutes to tens of minutes and dies with whatever shell started it. If your turn — or the sub-agent you are running as — can end before it returns, the delegate is killed **mid-edit**: the session is resumable, but the workspace is left holding half-finished, uncommitted work. **Detach the run, then wait on its log.**
 
-1. **Return only after the process exits.** Run the pipeline in the foreground of a call that you wait on. This is the simpler shape, and it holds only while the run fits inside the host's per-command timeout — Claude Code's Bash tool allows at most ten minutes, which a large task will outlast. Raise the timeout to its maximum when you take this path, and take the second one when the task is bigger than that or the host backgrounds the call regardless.
-2. **Detach it from your process group**, so ending your turn does not take the run with it:
+```bash
+setsid bash -c 'echo $$ > <RUN>/ca.pid; exec cursor-agent -p --trust --workspace <target repo> \
+  <envelope flags> --output-format stream-json \
+  < <RUN>/prompt.md > <RUN>/ca.ndjson 2> <RUN>/ca.err' &
+```
 
-   ```bash
-   setsid bash -c 'echo $$ > <RUN>/ca.pid; exec cursor-agent -p --trust --workspace <target repo> \
-     <envelope flags> --output-format stream-json \
-     < <RUN>/prompt.md > <RUN>/ca.ndjson 2> <RUN>/ca.err' &
-   ```
+The live `jq` view is lost — read `<RUN>/ca.ndjson` instead — but the run finishes on its own. Three details are load-bearing:
 
-   The live `jq` view is lost — read `<RUN>/ca.ndjson` instead — but the run finishes on its own. Three details are load-bearing:
+- **The inner shell records its own `$$` and then `exec`s**, so the pid file holds the run itself. `echo $! > <RUN>/ca.pid` does not work here: `setsid` forks, so `$!` is a wrapper that exits immediately, and polling it reports the run as finished seconds after it started
+- **stderr goes to its own file.** Merged into the log it breaks the NDJSON, and every `jq` query over the run then fails
+- `setsid` is Linux; where it is absent, use whatever detaches a process on that host
 
-   - **The inner shell records its own `$$` and then `exec`s**, so the pid file holds the run itself. `echo $! > <RUN>/ca.pid` does not work here: `setsid` forks, so `$!` is a wrapper that exits immediately, and polling it reports the run as finished seconds after it started
-   - **stderr goes to its own file.** Merged into the log it breaks the NDJSON, and every `jq` query over the run then fails
-   - `setsid` is Linux; where it is absent, use whatever detaches a process on that host
+**Do not run the `| tee | jq` pipeline in the foreground and wait on it instead.** It is the shorter shape, and it is exposed to the same leaked child the next section is about, in a form nothing can rescue: a dev server the delegate started inherits the pipeline's stdout, so `tee` never sees EOF and the call blocks even after cursor-agent has exited with its `result` already written to the log. Measured — the log held `{"type":"result",…}` while the pipeline sat there until the host's timeout killed it. Because the blocked call is your own, no wait loop runs and `await-run.sh` is never reached. Detaching writes the log with a plain redirect, so nothing is holding a pipe open.
+
+The one place the foreground pipeline still belongs is a short plan-mode run, where the sandbox blocks the delegate from starting anything.
 
 ### Wait on the log, never on the process
 
