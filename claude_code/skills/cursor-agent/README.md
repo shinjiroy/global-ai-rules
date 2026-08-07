@@ -12,7 +12,7 @@ An [Agent Skill](https://agentskills.io) for driving [`cursor-agent`](https://cu
 - Choosing a safety envelope — read-only (`--mode plan --sandbox enabled`) or a real implementation run
 - Reading `stream-json`, including the plan body that never reaches the `result` event
 - Judging success by `is_error`, not by the exit code
-- Keeping a run alive past the turn that started it, and telling an interrupted run from a failed one
+- Keeping a run alive past the turn that started it, deciding it is over from its log rather than its process, and telling an interrupted run from a failed one
 - Resuming a session instead of paying for a fresh one, including one that was cut off mid-edit
 - Six measured pitfalls that produce silent failures
 
@@ -27,7 +27,10 @@ cursor-agent/
     ├── preflight.sh          check everything that can abort, before anything expensive
     ├── new-run.sh            create a scratch dir for one delegation
     ├── collect-rules.sh      collect the .cursor/rules that apply to given paths
-    └── summarize-run.sh      report a run's outcome; exit code carries the verdict
+    ├── await-run.sh          wait for a detached run's result event, then reap what it leaked
+    ├── summarize-run.sh      report a run's outcome; exit code carries the verdict
+    └── tests/
+        └── await-run.test.sh run it directly; no cursor-agent or network needed
 ```
 
 ## Requirements
