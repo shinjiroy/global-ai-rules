@@ -46,6 +46,12 @@ new_run() {  # new_run <name> -> prints the run dir
 }
 result_event() { printf '{"type":"result","is_error":false,"session_id":"s1","result":"done"}\n'; }
 work_event() { printf '{"type":"assistant","session_id":"s1"}\n'; }
+tool_started() {  # tool_started <kind>, e.g. read -> readToolCall
+  printf '{"type":"tool_call","subtype":"started","call_id":"c","tool_call":{"%sToolCall":{"args":{}},"hookAdditionalContexts":[]}}\n' "$1"
+}
+tool_completed() {
+  printf '{"type":"tool_call","subtype":"completed","call_id":"c","tool_call":{"%sToolCall":{"args":{},"result":{}},"hookAdditionalContexts":[]}}\n' "$1"
+}
 
 # A stand-in for a cursor-agent run that leaks a child: the group leader sleeps,
 # and so does a child it started. Both must be gone once await-run.sh returns.
@@ -79,9 +85,9 @@ case $out in *"was killed"*) r=0 ;; *) r=1 ;; esac
 note "result event while the process is alive" "reports the kill" $r
 sleep 1
 kill -0 "$(cat "$d/ca.pid")" 2>/dev/null; r=$?
-note "result event while the process is alive" "the run process is gone" $([ $r -ne 0 ] && echo 0 || echo 1)
+note "result event while the process is alive" "the run process is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
 kill -0 "$(cat "$d/child.pid")" 2>/dev/null; r=$?
-note "result event while the process is alive" "the leaked child is gone" $([ $r -ne 0 ] && echo 0 || echo 1)
+note "result event while the process is alive" "the leaked child is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
 
 # --- 3. a result event that only arrives partway through the wait ---
 d=$(new_run result-later)
@@ -124,11 +130,90 @@ work_event > "$d/ca.ndjson"          # the first run's log must not be consulted
 "$await" "$d/ca-followup-1.ndjson" >/dev/null 2>&1
 check "follow-up log named explicitly" 0 $?
 
-# --- 8. usage errors ---
+# --- 8. the tool-call limit stops a live run and everything it started ---
+d=$(new_run tool-limit)
+start_leaky_run "$d" || exit 1
+{ work_event; tool_started read; tool_started edit; tool_started shell; } > "$d/ca.ndjson"
+out=$("$await" "$d/ca.ndjson" --max-tool-calls 3 --poll-seconds 1 2>&1); rc=$?
+check "tool-call limit reached" 5 $rc
+case $out in *TOOL_LIMIT:*) r=0 ;; *) r=1 ;; esac
+note "tool-call limit reached" "reports TOOL_LIMIT" $r
+case $out in *"tool calls: 3 (edit 1, read 1, shell 1)"*) r=0 ;; *) r=1 ;; esac
+note "tool-call limit reached" "reports the count and its breakdown" $r
+sleep 1
+kill -0 "$(cat "$d/ca.pid")" 2>/dev/null; r=$?
+note "tool-call limit reached" "the run process is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
+kill -0 "$(cat "$d/child.pid")" 2>/dev/null; r=$?
+note "tool-call limit reached" "the leaked child is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
+
+# --- 9. only `started` events count; `completed` ones for the same calls do not ---
+d=$(new_run tool-limit-completed-not-counted)
+start_leaky_run "$d" || exit 1
+{ tool_started read; tool_completed read; tool_started edit; tool_completed edit; } > "$d/ca.ndjson"
+( sleep 3; result_event >> "$d/ca.ndjson" ) &
+out=$("$await" "$d/ca.ndjson" --max-tool-calls 3 --poll-seconds 1 2>&1); rc=$?
+check "completed events are not counted" 0 $rc
+case $out in *"tool calls: 2 (edit 1, read 1)"*) r=0 ;; *) r=1 ;; esac
+note "completed events are not counted" "reports 2 calls" $r
+
+# --- 10. without the flag, no count stops a run ---
+d=$(new_run tool-limit-unset)
+start_leaky_run "$d" || exit 1
+for _ in 1 2 3 4 5 6 7 8; do tool_started read; done > "$d/ca.ndjson"
+( sleep 3; result_event >> "$d/ca.ndjson" ) &
+"$await" "$d/ca.ndjson" --poll-seconds 1 >/dev/null 2>&1
+check "no limit without --max-tool-calls" 0 $?
+
+# --- 11. a run that finished is finished, even past the limit ---
+d=$(new_run tool-limit-after-result)
+{ tool_started read; tool_started edit; result_event; } > "$d/ca.ndjson"
+"$await" "$d/ca.ndjson" --max-tool-calls 1 >/dev/null 2>&1
+check "result event wins over the limit" 0 $?
+
+# --- 12. a line cut off mid-write must not change how the run is judged ---
+# A killed run leaves exactly this behind. Before the fix, parsing it failed the
+# report and every path exited 5, telling the caller not to resume a run it should.
+d=$(new_run cut-off-line)
+{ tool_started read; printf '{"type":"tool_call","subtype":"started","call_id":"c","tool_call":{"editToo\n'; } > "$d/ca.ndjson"
+bash -c 'exit 0' & dead=$!; wait "$dead"; echo "$dead" > "$d/ca.pid"
+out=$("$await" "$d/ca.ndjson" --poll-seconds 1 2>&1); rc=$?
+check "cut-off line, process gone" 4 $rc
+case $out in *"tool calls: 2 (read 1, other 1)"*) r=0 ;; *) r=1 ;; esac
+note "cut-off line, process gone" "counts the cut-off call as other" $r
+
+# --- 13. over the limit after exiting on its own: still not to be resumed ---
+d=$(new_run tool-limit-dead)
+{ tool_started read; tool_started edit; } > "$d/ca.ndjson"
+bash -c 'exit 0' & dead=$!; wait "$dead"; echo "$dead" > "$d/ca.pid"
+out=$("$await" "$d/ca.ndjson" --max-tool-calls 2 --poll-seconds 1 2>&1); rc=$?
+check "over the limit, process already gone" 5 $rc
+case $out in *"had already exited"*) r=0 ;; *) r=1 ;; esac
+note "over the limit, process already gone" "says it was not killed here" $r
+
+# --- 14. over the limit with no pid file: nothing was stopped, and it says so ---
+d=$(new_run tool-limit-no-pid)
+{ tool_started read; tool_started edit; } > "$d/ca.ndjson"
+out=$("$await" "$d/ca.ndjson" --max-tool-calls 2 --poll-seconds 1 2>&1); rc=$?
+check "over the limit, no pid file" 5 $rc
+case $out in *"NOT stopped"*) r=0 ;; *) r=1 ;; esac
+note "over the limit, no pid file" "says the run was not stopped" $r
+
+# --- 15. the result event's usage is reported, after the verdict line ---
+d=$(new_run usage-reported)
+{ tool_started read; printf '{"type":"result","is_error":false,"session_id":"s1","usage":{"inputTokens":1,"outputTokens":2}}\n'; } > "$d/ca.ndjson"
+out=$("$await" "$d/ca.ndjson" 2>/dev/null)
+expected=$(printf '%s\n' 'FINISHED: result event present' 'tool calls: 1 (read 1)' 'usage: {"inputTokens":1,"outputTokens":2}')
+note "usage reported" "verdict, count, usage, in that order on stdout" "$([ "$out" = "$expected" ] && echo 0 || echo 1)"
+
+# --- 16. usage errors ---
 "$await" >/dev/null 2>&1;                            check "no arguments" 64 $?
 "$await" a b >/dev/null 2>&1;                        check "two logs" 64 $?
 "$await" a --stall-seconds x >/dev/null 2>&1;        check "non-numeric stall" 64 $?
 "$await" a --poll-seconds 0 >/dev/null 2>&1;         check "zero poll interval" 64 $?
+"$await" a --max-tool-calls x >/dev/null 2>&1;       check "non-numeric tool-call limit" 64 $?
+"$await" a --max-tool-calls 0 >/dev/null 2>&1;       check "zero tool-call limit" 64 $?
+"$await" a --max-tool-calls "" >/dev/null 2>&1;      check "empty tool-call limit" 64 $?
+"$await" a --stall-seconds "" >/dev/null 2>&1;       check "empty stall" 64 $?
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

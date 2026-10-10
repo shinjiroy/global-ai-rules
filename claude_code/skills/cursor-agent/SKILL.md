@@ -141,7 +141,7 @@ The one place the foreground pipeline still belongs is a short plan-mode run, wh
 ### Wait on the log, never on the process
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson
+${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson [--max-tool-calls N]
 ```
 
 **A run is over when `<RUN>/ca.ndjson` carries a `result` event.** Process liveness is not the signal: cursor-agent stays alive as long as it holds a foreground child it started — a dev server, a file watcher — so a loop like `while kill -0 "$(cat <RUN>/ca.pid)"; do sleep 30; done` blocks long after the delegate finished, with the completed result already sitting in the log (measured: 16 minutes). `await-run.sh` returns on the event, then kills the run's whole process group, which is what clears the leaked child.
@@ -151,6 +151,11 @@ ${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson
 | 0 | The `result` event arrived. Anything still running was killed; go read the result |
 | 3 | The log stopped growing for `--stall-seconds` (default 600) — read it before killing or resuming; this is the shape a genuine hang takes |
 | 4 | The process exited before its `result` event — cut off, not failed. Resume it |
+| 5 | `--max-tool-calls N` was given and the run started N or more tool calls; it was stopped. Do not resume it — see "After a run hit its tool-call limit" |
+
+Every exit except bad usage (64) prints how many tools the run started, by kind, and the `result` event's token usage when there is one.
+
+**`--max-tool-calls N` is the only per-run size limit there is.** cursor-agent has nothing like `claude -p`'s `--max-turns` / `--max-budget-usd`, and `usage` appears only in the final `result` event, so a run cannot be stopped by cost while it is going. The count of `tool_call` / `started` events can be watched, and that is what this flag caps. It is checked once per poll, so a run can overshoot N by the calls it starts within one poll interval. A run that hits the limit is a task that was sized wrong, not one that needs more turns: resuming it does not shrink the work left, and reloading the session's context makes each remaining turn cost more. Choose N when you write the prompt, from how much the task asks the delegate to read and change; a task you cannot fit under the N you would accept is one to split before dispatching, not after.
 
 It reads `<RUN>/ca.pid` from beside the log; a follow-up run logging to `ca-followup-N.ndjson` needs `--pid-file`. Waiting is all the script does, so a call that hits the host's per-command timeout can just be repeated — nothing is lost and the log is unchanged.
 
@@ -221,6 +226,17 @@ Two mechanics differ from a fresh delegation:
   Every event carries it, including the opening `system`/`init`. When the log is empty the run died before emitting anything: there is no id and no provenance to establish, so `--continue` — which resumes the most recent session — is the only route, and without a log to corroborate them the changes fall back under the ordinary dirty-tree abort.
 
 Say so in the follow-up prompt: the uncommitted changes are its own work in progress, it should read the current diff first and continue from there, and it must not stash or revert them. Without that, a delegate that finds an unexpectedly dirty tree may try to clean it up. Verification afterwards is unchanged, since the base commit you recorded still predates everything the delegation produced.
+
+### After a run hit its tool-call limit
+
+Exit 5 is not the interrupted case above, though the log looks the same: it has no `result` event, so `summarize-run.sh` calls it `INTERRUPTED` (exit 4) and says to resume. Ignore that advice for a run `await-run.sh` stopped at its limit. Its token usage is not recorded anywhere — usage exists only in the `result` event — so the tool-call count in `await-run.sh`'s report is the measure of how far it got.
+
+The delegate's edits stay in the working tree. Look at them against the task you dispatched:
+
+- **Inside the task's scope** — the task was just larger than N. Keep the edits, and delegate only what is left, narrowed until it fits
+- **Outside it** — the delegate wandered. Discard them and split the task before dispatching again
+
+Either way the tree must be clean before the next run: the next run is a new delegation, so the ordinary dirty-tree abort applies and the resume exception does not. Commit what you keep (or leave that decision to the user, per "Aborting") before dispatching the rest.
 
 ## Writing the prompt
 
