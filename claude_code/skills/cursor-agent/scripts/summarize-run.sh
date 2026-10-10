@@ -8,13 +8,21 @@
 # message, and — in plan mode — the plan body, which never reaches the `result`
 # event. Exits 1 when the log holds no `result` event and no work either, meaning
 # the run never started (untrusted directory, bad flags), 2 when it reports
-# is_error, and 4 when the run was cut off after it had begun working.
+# is_error, 4 when the run was cut off after it had begun working, and 5 when
+# await-run.sh stopped it at its tool-call limit (<log>.tool-limit exists).
 set -euo pipefail
 
 [ $# -eq 1 ] || { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 command -v jq >/dev/null || { echo "jq is required: https://jqlang.github.io/jq/" >&2; exit 64; }
 log=$1
 [ -f "$log" ] || { echo "no such log: $log" >&2; exit 64; }
+
+# A run stopped at its limit is not to be resumed, whatever the log looks like.
+# Its log can even hold a result event, written as the run was being killed.
+if [ -f "$log.tool-limit" ]; then
+  cat "$log.tool-limit" >&2
+  exit 5
+fi
 
 if ! grep -q '"type":"result"' "$log"; then
   # Work in the log without a result event means the run was killed mid-flight,

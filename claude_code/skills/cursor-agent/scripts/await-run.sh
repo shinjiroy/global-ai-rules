@@ -11,8 +11,10 @@
 # the work is done. This waits for the event, then kills whatever is left over.
 #
 # --max-tool-calls N stops the run once its log holds N `tool_call` / `started`
-# events. It is checked once per poll, so a run can overshoot N by the calls it
-# starts within one poll interval. Unset, there is no limit.
+# events, and leaves <log>.tool-limit beside the log so summarize-run.sh can tell
+# the run apart from one that was cut off. The count is checked once per poll and
+# only while this script is waiting, so a run overshoots N by what it starts
+# between checks and while it is being stopped. Unset, there is no limit.
 #
 # Exit: 0 finished / 3 stalled (no log activity) / 4 process gone before its
 #       result event / 5 tool-call limit reached / 64 bad usage
@@ -32,24 +34,28 @@ while [ $# -gt 0 ]; do
     --stall-seconds) stall_seconds=${2:-}; shift 2 || usage ;;
     --poll-seconds) poll_seconds=${2:-}; shift 2 || usage ;;
     --max-tool-calls) max_tool_calls=${2:-}; max_tool_calls_set=1; shift 2 || usage ;;
-    -h|--help) sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) usage ;;
     *) [ -z "$log" ] || usage; log=$1; shift ;;
   esac
 done
 [ -n "$log" ] || usage
 # An empty value is an unset variable on the caller's side, not "no limit".
-case $stall_seconds in ''|*[!0-9]*) usage ;; esac
-case $poll_seconds in ''|*[!0-9]*) usage ;; esac
-[ "$poll_seconds" -gt 0 ] || usage
+# Zero is rejected too: a zero stall window or limit ends every run on the first poll.
+positive() {  # positive <value> -> prints it in base 10, or fails
+  case $1 in ''|*[!0-9]*) return 1 ;; esac
+  [ ${#1} -le 9 ] && [ $((10#$1)) -gt 0 ] && echo $((10#$1))
+}
+stall_seconds=$(positive "$stall_seconds") || usage
+poll_seconds=$(positive "$poll_seconds") || usage
 if [ "$max_tool_calls_set" = 1 ]; then
-  case $max_tool_calls in ''|*[!0-9]*) usage ;; esac
-  [ "$max_tool_calls" -gt 0 ] || usage
+  max_tool_calls=$(positive "$max_tool_calls") || usage
 fi
 
-# Default to the pid file new-run.sh's layout puts beside the log. A follow-up run
-# logs to ca-followup-N.ndjson and must name its own pid file explicitly.
-if [ -z "$pid_file" ] && [ -f "$(dirname "$log")/ca.pid" ]; then
+# Default to the pid file new-run.sh's layout puts beside the first run's log. A
+# follow-up run logs to ca-followup-N.ndjson and must name its own pid file: the
+# first run's pid would make a live follow-up look finished.
+if [ -z "$pid_file" ] && [ "$(basename "$log")" = ca.ndjson ] && [ -f "$(dirname "$log")/ca.pid" ]; then
   pid_file="$(dirname "$log")/ca.pid"
 fi
 
@@ -63,7 +69,8 @@ has_result() { [ -f "$log" ] && grep -q '"type":"result"' "$log"; }
 alive() { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
 tool_calls() {
   [ -f "$log" ] || { echo 0; return; }
-  grep '"type":"tool_call"' "$log" | grep -c '"subtype":"started"' || true
+  # -a: one stray NUL would otherwise make grep treat the log as binary and count 0.
+  grep -a '"type":"tool_call"' "$log" | grep -ac '"subtype":"started"' || true
 }
 
 # How many tools the run started, by kind, and the token usage once there is a
@@ -76,9 +83,9 @@ report() {
   local n kinds=""
   n=$(tool_calls)
   if [ "$n" -gt 0 ] && command -v jq >/dev/null; then
-    kinds=$( { grep '"type":"tool_call"' "$log" | jq -R -r 'fromjson?
+    kinds=$( { grep -a '"type":"tool_call"' "$log" | jq -R -r 'fromjson?
           | select(.type == "tool_call" and .subtype == "started")
-          | .tool_call | objects | keys[] | select(endswith("ToolCall")) | sub("ToolCall$"; "")' \
+          | .tool_call | objects | first(keys[] | select(endswith("ToolCall"))) | sub("ToolCall$"; "")' \
           2>/dev/null || true; } \
       | sort | uniq -c \
       | awk -v n="$n" '{ a = a (NR > 1 ? ", " : "") $2 " " $1; s += $1 }
@@ -104,15 +111,22 @@ finish() {  # finish <exit> <verdict line>
 # Kill the run and every process it started. setsid made it a group leader, so the
 # whole group goes down with one signal — that is what clears a leaked dev server.
 # Signal the lone pid when it is not a leader, so an unrelated group is never hit.
+# Waits on the whole group, not the leader: a child that ignores TERM outlives a
+# leader that obeys it, and only KILL clears it. Sets $reaped to what was signalled.
 reap() {
   local pgid
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -dc '0-9' || true)
   local target=$pid
-  [ "$pgid" = "$pid" ] && target="-$pid"
+  reaped="with its group (pid $pid)"
+  if [ "$pgid" != "$pid" ]; then
+    reaped="alone (pid $pid is not a group leader, so processes it started may still be running)"
+  else
+    target="-$pid"
+  fi
   kill -TERM "$target" 2>/dev/null || true
   local i=0
-  while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
-  kill -0 "$pid" 2>/dev/null && kill -KILL "$target" 2>/dev/null || true
+  while [ $i -lt 10 ] && kill -0 -- "$target" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+  kill -0 -- "$target" 2>/dev/null && kill -KILL -- "$target" 2>/dev/null || true
 }
 
 # Nothing has been written yet on the first poll, so the stall clock starts here.
@@ -123,7 +137,7 @@ while :; do
   if has_result; then
     if alive; then
       reap
-      finish 0 "FINISHED: result event present; the process outlived it and was killed with its group (pid $pid)"
+      finish 0 "FINISHED: result event present; the process outlived it and was killed $reaped"
     fi
     finish 0 "FINISHED: result event present"
   fi
@@ -133,16 +147,21 @@ while :; do
   if [ -n "$max_tool_calls" ] && [ "$(tool_calls)" -ge "$max_tool_calls" ]; then
     if alive; then
       reap
-      how="was killed"
+      how="was killed $reaped"
+      # A result written now answers the kill (or lands in the same instant); the
+      # run went over its limit either way, so it does not turn this into a finish.
+      has_result && how="$how; it wrote a result event while being stopped"
     elif [ -n "$pid" ]; then
+      # Its last write can land after the exit was observed, as in the case below.
+      sleep 1
+      has_result && finish 0 "FINISHED: result event present"
       how="had already exited"
     else
       how="was NOT stopped (no pid file) — stop it before anything else"
     fi
-    # The run may have written its result while it was being stopped.
-    sleep 1
-    has_result && finish 0 "FINISHED: result event present"
-    finish 5 "TOOL_LIMIT: the run started $max_tool_calls or more tool calls and $how. Do not resume it; narrow the task and delegate the rest as a new run"
+    verdict="TOOL_LIMIT: the run started $max_tool_calls or more tool calls and $how. Do not resume it; narrow the task and delegate the rest as a new run"
+    printf '%s\n' "$verdict" > "$log.tool-limit" || true
+    finish 5 "$verdict"
   fi
 
   # Only conclusive once the log is caught up: check the result again after the

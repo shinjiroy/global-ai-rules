@@ -31,7 +31,8 @@ cursor-agent/
     ├── await-run.sh          wait for a detached run's result event, then reap what it leaked
     ├── summarize-run.sh      report a run's outcome; exit code carries the verdict
     └── tests/
-        └── await-run.test.sh run it directly; no cursor-agent or network needed
+        ├── await-run.test.sh     run either directly; no cursor-agent or network needed
+        └── summarize-run.test.sh
 ```
 
 ## Requirements
