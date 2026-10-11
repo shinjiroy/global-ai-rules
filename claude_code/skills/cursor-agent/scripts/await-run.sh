@@ -3,7 +3,8 @@
 #
 # Usage:
 #     await-run.sh <log.ndjson> [--pid-file <path>] [--stall-seconds N] [--poll-seconds N]
-#                  [--max-tool-calls N]
+#                  [--max-tool-calls N] [--detach]
+#     await-run.sh <log.ndjson> --result [--poll-seconds N]
 #
 # A run is over when its log carries a `result` event — not when the process
 # exits. cursor-agent keeps running while it holds a foreground child it started
@@ -16,11 +17,24 @@
 # only while this script is waiting, so a run overshoots N by what it starts
 # between checks and while it is being stopped. Unset, there is no limit.
 #
+# --detach runs the same wait as a watcher in its own session and returns once the
+# watcher is up, so the limit and the stall check outlive the caller (a host
+# timeout, an interrupted turn, a session out of budget). The watcher leaves what a
+# foreground call would print in <log>.await.out and its exit code in
+# <log>.await.rc. --result waits for those and exits with that code; it only reads
+# files, so it can be repeated from any turn or session. A detached watcher that
+# reports a stall keeps watching: the 3 is withdrawn if the log grows again, and
+# replaced when the run ends.
+#
 # Exit: 0 finished / 3 stalled (no log activity) / 4 process gone before its
 #       result event / 5 tool-call limit reached / 64 bad usage
+#       --detach: 0 watcher started / 6 a watcher already watches this log /
+#                 7 the watcher could not be started
+#       --result: the watcher's exit code / 8 no watcher is running and none left
+#                 a verdict
 set -euo pipefail
 
-usage() { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '3,7p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 log=""
 pid_file=""
@@ -28,18 +42,23 @@ stall_seconds=600     # cursor-agent streams thinking and tool events well insid
 poll_seconds=10
 max_tool_calls=""
 max_tool_calls_set=0
+mode="wait"           # wait / detach / result
+wait_flags=0          # flags that only a wait uses, which --result rejects
 while [ $# -gt 0 ]; do
   case "$1" in
-    --pid-file) pid_file=${2:-}; shift 2 || usage ;;
-    --stall-seconds) stall_seconds=${2:-}; shift 2 || usage ;;
+    --pid-file) pid_file=${2:-}; wait_flags=1; shift 2 || usage ;;
+    --stall-seconds) stall_seconds=${2:-}; wait_flags=1; shift 2 || usage ;;
     --poll-seconds) poll_seconds=${2:-}; shift 2 || usage ;;
-    --max-tool-calls) max_tool_calls=${2:-}; max_tool_calls_set=1; shift 2 || usage ;;
-    -h|--help) sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --max-tool-calls) max_tool_calls=${2:-}; max_tool_calls_set=1; wait_flags=1; shift 2 || usage ;;
+    --detach) [ "$mode" = wait ] || usage; mode=detach; shift ;;
+    --result) [ "$mode" = wait ] || usage; mode=result; shift ;;
+    -h|--help) sed -n '3,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) usage ;;
     *) [ -z "$log" ] || usage; log=$1; shift ;;
   esac
 done
 [ -n "$log" ] || usage
+[ "$mode" = result ] && [ "$wait_flags" = 1 ] && usage
 # An empty value is an unset variable on the caller's side, not "no limit".
 # Zero is rejected too: a zero stall window or limit ends every run on the first poll.
 positive() {  # positive <value> -> prints it in base 10, or fails
@@ -50,6 +69,106 @@ stall_seconds=$(positive "$stall_seconds") || usage
 poll_seconds=$(positive "$poll_seconds") || usage
 if [ "$max_tool_calls_set" = 1 ]; then
   max_tool_calls=$(positive "$max_tool_calls") || usage
+fi
+
+# --- detached watcher: start one, or wait on one ---------------------------------
+
+abs_path() {  # abs_path <path> -> the same path from /, or fails if its directory is missing
+  local d
+  d=$(cd "$(dirname "$1")" 2>/dev/null && pwd) || return 1
+  printf '%s/%s\n' "$d" "$(basename "$1")"
+}
+set_watch_paths() {
+  watch_pid=$log.await.pid
+  watch_out=$log.await.out
+  watch_rc=$log.await.rc
+}
+# A watcher is identified by its command line, not only its pid: a pid file left by
+# a dead watcher can name a pid since reused by something unrelated. The log is
+# always passed as an absolute path and first, so the match is exact.
+watcher_alive() {
+  local p
+  [ -s "$watch_pid" ] || return 1
+  p=$(tr -dc '0-9' < "$watch_pid" 2>/dev/null) || return 1
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null || return 1
+  ps -ww -o args= -p "$p" 2>/dev/null | grep -qF -- "await-run.sh $log "
+}
+
+if [ "$mode" = result ]; then
+  gone() {
+    echo "GONE: no watcher is running for $1 and none left a verdict — start one with --detach and the same flags; the count resumes from the log" >&2
+    exit 8
+  }
+  given=$log
+  log=$(abs_path "$log") || gone "$given"
+  set_watch_paths
+  while :; do
+    # The watcher writes .await.out before .await.rc and withdraws a stall verdict
+    # in the opposite order, so a code that is readable has its output beside it.
+    if rc=$(tr -dc '0-9' < "$watch_rc" 2>/dev/null) && [ -n "$rc" ]; then
+      if [ "$rc" = 0 ]; then cat "$watch_out" 2>/dev/null || true
+      else cat "$watch_out" >&2 2>/dev/null || true; fi
+      exit "$rc"
+    fi
+    # Checked after the code: the watcher removes its pid file once the code is in place.
+    if ! watcher_alive; then
+      [ -s "$watch_rc" ] && continue
+      gone "$given"
+    fi
+    sleep "$poll_seconds"
+  done
+fi
+
+if [ "$mode" = detach ]; then
+  given=$log
+  log=$(abs_path "$log") || { echo "NOT_STARTED: the directory of $given does not exist" >&2; exit 7; }
+  if [ -n "$pid_file" ]; then pid_file=$(abs_path "$pid_file" || printf '%s' "$pid_file"); fi
+  set_watch_paths
+  command -v setsid >/dev/null || {
+    echo "NOT_STARTED: setsid is not available, so a watcher would die with this call — wait in the foreground instead" >&2
+    exit 7
+  }
+  # Two --detach calls racing for one log must not both start a watcher. The lock
+  # is held only while starting; the watcher does not inherit it.
+  if command -v flock >/dev/null; then
+    exec 9> "$log.await.lock"
+    flock -n 9 || { echo "WATCHING: another --detach is starting a watcher for $log — wait on it with --result" >&2; exit 6; }
+  fi
+  if watcher_alive; then
+    echo "WATCHING: a watcher (pid $(tr -dc '0-9' < "$watch_pid")) already watches $log — wait on it with --result" >&2
+    exit 6
+  fi
+  # A verdict left by an earlier watcher would answer --result before this one has looked.
+  rm -f "$watch_rc" "$watch_out" "$watch_pid"
+  args=("$log" --stall-seconds "$stall_seconds" --poll-seconds "$poll_seconds")
+  [ -n "$pid_file" ] && args+=(--pid-file "$pid_file")
+  [ -n "$max_tool_calls" ] && args+=(--max-tool-calls "$max_tool_calls")
+  self=$(abs_path "${BASH_SOURCE[0]}")
+  AWAIT_RUN_WATCHER=1 setsid bash "$self" "${args[@]}" </dev/null >/dev/null 2>&1 9>&- &
+  starter=$!
+  # setsid forks when it is started as a group leader, so its own exit says nothing
+  # about the watcher — only a failing exit does. Returning before the pid file is
+  # written would let a --result right after this read the run as unwatched.
+  i=0
+  until watcher_alive || [ -f "$watch_rc" ]; do
+    if [ -n "$starter" ] && ! kill -0 "$starter" 2>/dev/null; then
+      # Not forked, the starter is the watcher, and its exit is the verdict it wrote.
+      wait "$starter" || [ -f "$watch_rc" ] || { echo "NOT_STARTED: the watcher for $log failed to start" >&2; exit 7; }
+      starter=""
+    fi
+    i=$((i + 1))
+    [ $i -le 100 ] || { echo "NOT_STARTED: the watcher for $log did not start within 10s" >&2; exit 7; }
+    sleep 0.1
+  done
+  echo "WATCHING: a detached watcher is waiting on $given — get its verdict with: await-run.sh '$given' --result"
+  exit 0
+fi
+
+watcher=""
+if [ "${AWAIT_RUN_WATCHER:-}" = 1 ]; then
+  watcher=1
+  set_watch_paths
+  printf '%s\n' "$$" > "$watch_pid.tmp" && mv -f "$watch_pid.tmp" "$watch_pid"
 fi
 
 # Default to the pid file new-run.sh's layout puts beside the first run's log. A
@@ -97,10 +216,22 @@ report() {
   fi
 }
 
+# What a foreground call would print, written for --result to read. Each file is
+# written under a temporary name and moved into place, the output before the code.
+publish() {  # publish <exit> <verdict line>
+  { echo "$2"; report; } > "$watch_out.tmp"
+  mv -f "$watch_out.tmp" "$watch_out"
+  echo "$1" > "$watch_rc.tmp"
+  mv -f "$watch_rc.tmp" "$watch_rc"
+}
+
 # The verdict line comes first and the report follows it on the same stream:
 # stdout when the run finished, stderr otherwise.
 finish() {  # finish <exit> <verdict line>
-  if [ "$1" = 0 ]; then
+  if [ -n "$watcher" ]; then
+    publish "$1" "$2"
+    rm -f "$watch_pid"
+  elif [ "$1" = 0 ]; then
     echo "$2"; report
   else
     { echo "$2"; report; } >&2
@@ -132,6 +263,7 @@ reap() {
 # Nothing has been written yet on the first poll, so the stall clock starts here.
 last_activity=$(date +%s)
 [ -f "$log" ] && last_activity=$(mtime "$log")
+stalled=0
 
 while :; do
   if has_result; then
@@ -175,7 +307,20 @@ while :; do
   now=$(date +%s)
   [ -f "$log" ] && last_activity=$(mtime "$log")
   if [ $((now - last_activity)) -ge "$stall_seconds" ]; then
-    finish 3 "STALLED: no log activity for ${stall_seconds}s — inspect $log before killing or resuming"
+    verdict="STALLED: no log activity for ${stall_seconds}s — inspect $log before killing or resuming"
+    # Detached, the watcher is the only thing holding the limit, and a stalled run
+    # can start moving again. With no process to watch there is nothing left to hold.
+    if [ -n "$watcher" ] && [ -n "$pid" ]; then
+      if [ "$stalled" = 0 ]; then
+        publish 3 "$verdict. This watcher keeps watching: the verdict is withdrawn if the log grows again, and replaced when the run ends"
+        stalled=1
+      fi
+    else
+      finish 3 "$verdict"
+    fi
+  elif [ "$stalled" = 1 ]; then
+    rm -f "$watch_rc" "$watch_out"
+    stalled=0
   fi
 
   sleep "$poll_seconds"

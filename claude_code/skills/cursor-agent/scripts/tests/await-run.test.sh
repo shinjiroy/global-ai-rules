@@ -17,7 +17,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/await-run-test-XXXXXX")
 
 # A case that fails may leave its sleeper running, and the suite must still end.
 cleanup() {
-  for f in "$tmp"/*/ca.pid "$tmp"/*/child.pid; do
+  for f in "$tmp"/*/*.await.pid "$tmp"/*/ca.pid "$tmp"/*/child.pid "$tmp"/*/other.pid; do
     [ -s "$f" ] || continue
     kill -TERM -"$(cat "$f")" 2>/dev/null || kill -TERM "$(cat "$f")" 2>/dev/null || true
   done
@@ -287,6 +287,166 @@ aw a --max-tool-calls "" >/dev/null 2>&1;      check "empty tool-call limit" 64 
 aw a --stall-seconds "" >/dev/null 2>&1;       check "empty stall" 64 $?
 aw a --stall-seconds 0 >/dev/null 2>&1;        check "zero stall" 64 $?
 aw a --poll-seconds "" >/dev/null 2>&1;        check "empty poll interval" 64 $?
+
+# --- detached watcher (--detach / --result) ---
+gone_pid() { ! kill -0 "$1" 2>/dev/null && echo 0 || echo 1; }
+watchers_of() { pgrep -fc -- "await-run.sh $1 " || true; }
+wait_until() {  # wait_until <seconds> <command...> -> 0 once the command succeeds
+  local i=0
+  until "${@:2}"; do i=$((i + 1)); [ $i -le $(($1 * 10)) ] || return 1; sleep 0.1; done
+}
+
+# --- 23. detached: the verdict and report come back through --result ---
+d=$(new_run detach-finished)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+check "detach: start" 0 $?
+( sleep 2; result_event >> "$d/ca.ndjson" ) &
+out=$(aw "$d/ca.ndjson" --result --poll-seconds 1 2>/dev/null); rc=$?
+check "detach: run finishes" 0 $rc
+case $out in "FINISHED:"*"tool calls: 0"*) r=0 ;; *) r=1 ;; esac
+note "detach: run finishes" "prints the watcher's verdict and report on stdout" $r
+note "detach: run finishes" "the verdict files are named after the log" "$([ -f "$d/ca.ndjson.await.rc" ] && [ -f "$d/ca.ndjson.await.out" ] && echo 0 || echo 1)"
+sleep 1
+note "detach: run finishes" "the leaked child is gone" "$(gone_pid "$(cat "$d/child.pid")")"
+out2=$(aw "$d/ca.ndjson" --result 2>/dev/null); rc=$?
+check "detach: --result repeated after the watcher exited" 0 $rc
+note "detach: --result repeated after the watcher exited" "prints the same output" "$([ "$out" = "$out2" ] && echo 0 || echo 1)"
+
+# --- 24. --detach returns only once the watcher is recorded ---
+# Returning earlier let a --result right after it read the run as unwatched.
+d=$(new_run detach-recorded)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+p=$(cat "$d/ca.ndjson.await.pid" 2>/dev/null)
+note "detach: recorded on return" "the pid file names a live watcher" "$([ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo 0 || echo 1)"
+timeout 3 "$await" "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: --result right after start keeps waiting" 124 $?
+
+# --- 25. detached: the tool-call limit stops the run with no caller waiting ---
+d=$(new_run detach-tool-limit)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+aw "$d/ca.ndjson" --detach --max-tool-calls 3 --poll-seconds 1 >/dev/null 2>&1
+{ tool_started read; tool_started edit; tool_started shell; } >> "$d/ca.ndjson"
+wait_until 15 test -f "$d/ca.ndjson.await.rc"
+note "detach: tool-call limit" "the watcher acts with nobody waiting" $?
+out=$(aw "$d/ca.ndjson" --result --poll-seconds 1 2>&1); rc=$?
+check "detach: tool-call limit" 5 $rc
+case $out in TOOL_LIMIT:*) r=0 ;; *) r=1 ;; esac
+note "detach: tool-call limit" "prints TOOL_LIMIT" $r
+sleep 1
+note "detach: tool-call limit" "the run process is gone" "$(gone_pid "$(cat "$d/ca.pid")")"
+note "detach: tool-call limit" "leaves the tool-limit marker" "$([ -f "$d/ca.ndjson.tool-limit" ] && echo 0 || echo 1)"
+
+# --- 26. a follow-up never reads the first run's verdict ---
+d=$(new_run detach-followup)
+echo 0 > "$d/ca.ndjson.await.rc"; echo "FINISHED: result event present" > "$d/ca.ndjson.await.out"
+work_event > "$d/ca-followup-1.ndjson"
+aw "$d/ca-followup-1.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: follow-up with no watcher of its own" 8 $?
+
+# --- 27. a watcher killed before its verdict: reported, and restartable once ---
+d=$(new_run detach-killed)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+kill -KILL "$(cat "$d/ca.ndjson.await.pid")"
+aw "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: watcher killed" 8 $?
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+check "detach: restart after the watcher was killed" 0 $?
+note "detach: restart after the watcher was killed" "exactly one watcher runs" "$([ "$(watchers_of "$d/ca.ndjson")" = 1 ] && echo 0 || echo 1)"
+
+# --- 28. a second --detach while a watcher runs is refused ---
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+check "detach: second watcher refused" 6 $?
+note "detach: second watcher refused" "still exactly one watcher" "$([ "$(watchers_of "$d/ca.ndjson")" = 1 ] && echo 0 || echo 1)"
+
+# --- 29. a verdict left by an earlier watcher does not answer the new one ---
+d=$(new_run detach-stale-verdict)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+echo 0 > "$d/ca.ndjson.await.rc"; echo "FINISHED: result event present" > "$d/ca.ndjson.await.out"
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+timeout 3 "$await" "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: stale verdict cleared" 124 $?
+
+# --- 30. after a stall the watcher keeps holding the limit ---
+# Exiting on the stall left a run that started moving again unwatched, and it then
+# finished past its limit looking like a normal finish.
+d=$(new_run detach-stall-resumes)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+touch -d '@0' "$d/ca.ndjson" 2>/dev/null || touch -t 197001020000 "$d/ca.ndjson"
+aw "$d/ca.ndjson" --detach --stall-seconds 2 --poll-seconds 1 --max-tool-calls 2 >/dev/null 2>&1
+out=$(aw "$d/ca.ndjson" --result --poll-seconds 1 2>&1); rc=$?
+check "detach: stall reported" 3 $rc
+case $out in STALLED:*"keeps watching"*) r=0 ;; *) r=1 ;; esac
+note "detach: stall reported" "says the watcher keeps watching" $r
+note "detach: stall reported" "the watcher is still running" "$([ "$(watchers_of "$d/ca.ndjson")" = 1 ] && echo 0 || echo 1)"
+work_event >> "$d/ca.ndjson"
+wait_until 5 test ! -e "$d/ca.ndjson.await.rc"
+note "detach: stall reported" "the verdict is withdrawn once the log grows" $?
+{ tool_started read; tool_started edit; } >> "$d/ca.ndjson"
+aw "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: limit reached after a stall" 5 $?
+sleep 1
+note "detach: limit reached after a stall" "the run process is gone" "$(gone_pid "$(cat "$d/ca.pid")")"
+
+# --- 31. a stall with no process to watch ends the watcher ---
+d=$(new_run detach-stall-no-pid)
+work_event > "$d/ca-followup-1.ndjson"
+touch -d '@0' "$d/ca-followup-1.ndjson" 2>/dev/null || touch -t 197001020000 "$d/ca-followup-1.ndjson"
+aw "$d/ca-followup-1.ndjson" --detach --stall-seconds 2 --poll-seconds 1 >/dev/null 2>&1
+aw "$d/ca-followup-1.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: stall with no pid file" 3 $?
+wait_until 3 test "$(watchers_of "$d/ca-followup-1.ndjson")" = 0
+note "detach: stall with no pid file" "the watcher exited" $?
+
+# --- 32. nothing to wait on: --result returns at once ---
+aw "$tmp/no-such-run/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: --result for a run directory that is gone" 8 $?
+aw "$tmp/no-such-run/ca.ndjson" --detach >/dev/null 2>&1
+check "detach: --detach for a run directory that is gone" 7 $?
+
+# --- 33. a watcher that cannot start fails --detach instead of leaving --result to spin ---
+d=$(new_run detach-setsid-fails)
+mkdir -p "$d/bin"; printf '#!/bin/sh
+exit 1
+' > "$d/bin/setsid"; chmod +x "$d/bin/setsid"
+work_event > "$d/ca.ndjson"
+PATH="$d/bin:$PATH" timeout 5 "$await" "$d/ca.ndjson" --detach >/dev/null 2>&1
+check "detach: setsid fails" 7 $?
+aw "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: --result after a failed start" 8 $?
+
+# --- 34. a pid file whose pid now belongs to something else ---
+d=$(new_run detach-pid-reused)
+work_event > "$d/ca.ndjson"
+setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > "$d/other.pid"
+sleep 0.2
+cp "$d/other.pid" "$d/ca.ndjson.await.pid"
+aw "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: pid reused by another process" 8 $?
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+check "detach: start over a reused pid" 0 $?
+
+# --- 35. a run directory with a space in it ---
+d=$(new_run "detach with space")
+result_event > "$d/ca.ndjson"
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+check "detach: path with a space" 0 $?
+aw "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: --result on a path with a space" 0 $?
+
+# --- 36. usage errors specific to the detached forms ---
+aw a --detach --result >/dev/null 2>&1;           check "--detach with --result" 64 $?
+aw a --result --max-tool-calls 3 >/dev/null 2>&1; check "--result with a wait flag" 64 $?
+aw a --result --pid-file p >/dev/null 2>&1;       check "--result with --pid-file" 64 $?
+aw a --detach --max-tool-calls 0 >/dev/null 2>&1; check "--detach validates before starting" 64 $?
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
