@@ -132,7 +132,7 @@ The live `jq` view is lost — read `<RUN>/ca.ndjson` instead — but the run fi
 
 - **The inner shell records its own `$$` and then `exec`s**, so the pid file holds the run itself. `echo $! > <RUN>/ca.pid` does not work here: `setsid` forks, so `$!` is a wrapper that exits immediately, and polling it reports the run as finished seconds after it started
 - **stderr goes to its own file.** Merged into the log it breaks the NDJSON, and every `jq` query over the run then fails
-- `setsid` is Linux; where it is absent, use whatever detaches a process on that host
+- `setsid` is Linux; where it is absent, use whatever detaches a process on that host. A run that is not a process-group leader can only be stopped by itself — anything it started survives — and `await-run.sh` says so when it kills one
 
 **Do not run the `| tee | jq` pipeline in the foreground and wait on it instead.** It is the shorter shape, and it is exposed to the same leaked child the next section is about, in a form nothing can rescue: a dev server the delegate started inherits the pipeline's stdout, so `tee` never sees EOF and the call blocks even after cursor-agent has exited with its `result` already written to the log. Measured — the log held `{"type":"result",…}` while the pipeline sat there until the host's timeout killed it. Because the blocked call is your own, no wait loop runs and `await-run.sh` is never reached. Detaching writes the log with a plain redirect, so nothing is holding a pipe open.
 
@@ -141,7 +141,7 @@ The one place the foreground pipeline still belongs is a short plan-mode run, wh
 ### Wait on the log, never on the process
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson
+${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson [--max-tool-calls N]
 ```
 
 **A run is over when `<RUN>/ca.ndjson` carries a `result` event.** Process liveness is not the signal: cursor-agent stays alive as long as it holds a foreground child it started — a dev server, a file watcher — so a loop like `while kill -0 "$(cat <RUN>/ca.pid)"; do sleep 30; done` blocks long after the delegate finished, with the completed result already sitting in the log (measured: 16 minutes). `await-run.sh` returns on the event, then kills the run's whole process group, which is what clears the leaked child.
@@ -151,12 +151,17 @@ ${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson
 | 0 | The `result` event arrived. Anything still running was killed; go read the result |
 | 3 | The log stopped growing for `--stall-seconds` (default 600) — read it before killing or resuming; this is the shape a genuine hang takes |
 | 4 | The process exited before its `result` event — cut off, not failed. Resume it |
+| 5 | `--max-tool-calls N` was given and the run started N or more tool calls. The `TOOL_LIMIT:` line says whether it was killed, had already exited, or — with no pid file — is still running and must be stopped before anything else. Do not resume it — see "After a run hit its tool-call limit" |
 
-It reads `<RUN>/ca.pid` from beside the log; a follow-up run logging to `ca-followup-N.ndjson` needs `--pid-file`. Waiting is all the script does, so a call that hits the host's per-command timeout can just be repeated — nothing is lost and the log is unchanged.
+Every verdict (any exit but bad usage and `--help`) is followed by how many tools the run started, by kind, and the `result` event's token usage when there is one. Exit 0 prints both on stdout; every other exit prints them on stderr.
+
+**`--max-tool-calls N` is the only per-run size limit there is.** cursor-agent has nothing like `claude -p`'s `--max-turns` / `--max-budget-usd`, and `usage` appears only in the final `result` event, so a run cannot be stopped by cost while it is going. The count of `tool_call` / `started` events can be watched, and that is what this flag caps. It is checked once per poll and only while `await-run.sh` is waiting, so a run overshoots N by the calls it starts between checks, while it is being stopped, and while no `await-run.sh` call is running. A run that hits the limit is a task that was sized wrong, not one that needs more turns: resuming it does not shrink the work left, and reloading the session's context makes each remaining turn cost more. Choose N when you write the prompt, from how much the task asks the delegate to read and change; a task you cannot fit under the N you would accept is one to split before dispatching, not after.
+
+It reads `<RUN>/ca.pid` from beside `ca.ndjson`; a follow-up run logging to `ca-followup-N.ndjson` needs `--pid-file`, or the script knows no process to watch or stop. A call that hits the host's per-command timeout can be repeated with the same flags, and the log is unchanged — but the limit is enforced only while a call is waiting, so repeat it at once.
 
 Never poll by process **name**. `pgrep -f cursor-agent` matches the shell running that very command and so waits on itself forever, and the character-class form (`pgrep -f "[c]ursor-agent"`) matches an unrelated concurrent delegation instead.
 
-A log whose last event is anything but `result` is a run that was cut off rather than one that failed; `summarize-run.sh` reports that case as `INTERRUPTED` (exit 4) as well.
+A log whose last event is anything but `result` is a run that was cut off rather than one that failed — unless `await-run.sh` stopped it at its limit, which leaves `<log>.tool-limit` beside the log. `summarize-run.sh` reports the first as `INTERRUPTED` (exit 4) and the second as `TOOL_LIMIT` (exit 5).
 
 ## Pitfalls (measured; absent from `--help`)
 
@@ -185,6 +190,7 @@ It prints `is_error`, token usage, the session id needed for `--resume`, the pla
 | 1 | No `result` event and no work in the log — the run never started (untrusted directory, bad flags) |
 | 2 | The run reported `is_error=true` |
 | 4 | The run worked, then was cut off before its `result` event — resume it, do not restart |
+| 5 | `await-run.sh` stopped the run at its tool-call limit (`<log>.tool-limit` exists) — do not resume it; see "After a run hit its tool-call limit" |
 
 `is_error=false` means the agent terminated normally — **not** that the work is correct. After delegating an implementation, verify with `git -C <target repo> status`, `git -C <target repo> diff`, and the repository's own tests. If the repository has no test runner, exercise the changed code directly from the scratch dir (a throwaway script under `<RUN>/`, never a file inside the repo) — an unverified diff is not a finished delegation.
 
@@ -221,6 +227,17 @@ Two mechanics differ from a fresh delegation:
   Every event carries it, including the opening `system`/`init`. When the log is empty the run died before emitting anything: there is no id and no provenance to establish, so `--continue` — which resumes the most recent session — is the only route, and without a log to corroborate them the changes fall back under the ordinary dirty-tree abort.
 
 Say so in the follow-up prompt: the uncommitted changes are its own work in progress, it should read the current diff first and continue from there, and it must not stash or revert them. Without that, a delegate that finds an unexpectedly dirty tree may try to clean it up. Verification afterwards is unchanged, since the base commit you recorded still predates everything the delegation produced.
+
+### After a run hit its tool-call limit
+
+Exit 5 is not the interrupted case above, though the log usually looks the same. What tells them apart is the `<log>.tool-limit` file `await-run.sh` leaves beside the log, which makes `summarize-run.sh` exit 5 as well. The run's token usage is usually not recorded — usage exists only in the `result` event — so the tool-call count in `await-run.sh`'s report is the measure of how far it got.
+
+The delegate's edits stay in the working tree. Look at them against the task you dispatched:
+
+- **Inside the task's scope** — the task was just larger than N. Keep the edits, and delegate only what is left, narrowed until it fits
+- **Outside it** — the delegate wandered. Discard them and split the task before dispatching again
+
+Either way the tree must be clean before the next run: the next run is a new delegation, so the ordinary dirty-tree abort applies and the resume exception does not. Commit what you keep (or leave that decision to the user, per "Aborting") before dispatching the rest.
 
 ## Writing the prompt
 

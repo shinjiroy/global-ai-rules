@@ -13,6 +13,7 @@ An [Agent Skill](https://agentskills.io) for driving [`cursor-agent`](https://cu
 - Reading `stream-json`, including the plan body that never reaches the `result` event
 - Judging success by `is_error`, not by the exit code
 - Keeping a run alive past the turn that started it, deciding it is over from its log rather than its process, and telling an interrupted run from a failed one
+- Capping one run's size by the number of tool calls it starts, since cursor-agent has no turn or budget limit of its own
 - Resuming a session instead of paying for a fresh one, including one that was cut off mid-edit
 - Six measured pitfalls that produce silent failures
 
@@ -30,7 +31,8 @@ cursor-agent/
     ├── await-run.sh          wait for a detached run's result event, then reap what it leaked
     ├── summarize-run.sh      report a run's outcome; exit code carries the verdict
     └── tests/
-        └── await-run.test.sh run it directly; no cursor-agent or network needed
+        ├── await-run.test.sh     run either directly; no cursor-agent or network needed
+        └── summarize-run.test.sh
 ```
 
 ## Requirements
