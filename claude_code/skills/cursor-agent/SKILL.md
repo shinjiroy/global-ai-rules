@@ -92,7 +92,7 @@ It seeds `<RUN>/prompt.md` from `assets/prompt-template.md`. Everything one dele
 | `prompt.md` | The delegated task, plus the repository rules appended to it |
 | `ca.ndjson` | The complete stream log — the authority for every judgment about the run |
 | `ca.pid`, `ca.err` | The detached run's pid and stderr, written by the invocation below |
-| `<log>.await.pid` / `.out` / `.rc` / `.err` / `.lock` | A detached watcher's pid, verdict, exit code, stderr and start lock, written by `await-run.sh --detach`. Named after the log, so a follow-up's watcher never answers for the first run |
+| `<log>.await.*` | A detached watcher's files, written by `await-run.sh --detach`: `.pid` (who is watching), `.out` / `.rc` (its verdict and exit code), `.err` (its stderr) and the locks and token that keep it to one watcher. Named after the log, so a follow-up's watcher never answers for the first run |
 | `followup-N.md` | The Nth `--resume` prompt |
 | `ca-followup-N.ndjson` | Its log. Numbered, so a follow-up never overwrites the first log |
 | `check.*` | A throwaway script used to exercise the change when the repo has no test runner |
@@ -170,9 +170,9 @@ ${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson --result
 ```
 
 - `--detach` takes the same flags as a foreground wait and returns once the watcher is recorded: 0 started, 6 a watcher already watches this log (wait on it), 7 it could not be started (no `setsid` or `flock` — so not on macOS —, a run directory that is gone or not writable, or a watcher that did not come up) — wait in the foreground instead
-- `--result` prints what a foreground call would and exits with the watcher's code from the table above. It only reads files, so repeat it after a host timeout, in a later turn or in a new session
+- `--result` prints what a foreground call would and exits with the watcher's code from the table above, waiting until there is one. It only reads files, so repeat it after a host timeout, in a later turn or in a new session
 - **8 from `--result` means no watcher is running and none left a final verdict** — it was killed, or never started. `<log>.await.err` holds what it said before it died. Run the same `--detach` again; the count resumes from the log
-- **After a stall (3) the watcher keeps watching, as long as it knows the run's pid.** The verdict is withdrawn if the log grows again and replaced when the run ends, so a later `--result` can return a different code. Killing the run turns it into 4. A follow-up started without `--pid-file` has no pid to watch, and its watcher ends on the 3
+- **After a stall (3) the watcher keeps watching, as long as it knows the run's pid and the run lives.** `--result` returns the 3 at once, with a line saying so. Read the log, then either kill the run, which turns the verdict into 4, or call `--result` again later: the 3 is withdrawn if the log grows again and replaced when the run ends. A follow-up started without `--pid-file` has no pid to watch, and its watcher ends on the 3
 
 Never poll by process **name**. `pgrep -f cursor-agent` matches the shell running that very command and so waits on itself forever, and the character-class form (`pgrep -f "[c]ursor-agent"`) matches an unrelated concurrent delegation instead.
 

@@ -23,8 +23,9 @@
 # foreground call would print in <log>.await.out and its exit code in
 # <log>.await.rc. --result waits for those and exits with that code; it only reads
 # files, so it can be repeated from any turn or session. A detached watcher that
-# reports a stall keeps watching while it knows the run's pid: the 3 is withdrawn
-# if the log grows again, and replaced when the run ends.
+# reports a stall keeps watching while it knows the run's pid, for as long as the
+# run lives: --result returns that 3 at once, and it is withdrawn if the log grows
+# again and replaced when the run ends.
 #
 # Exit: 0 finished / 3 stalled (no log activity) / 4 process gone before its
 #       result event / 5 tool-call limit reached / 64 bad usage
@@ -52,7 +53,7 @@ while [ $# -gt 0 ]; do
     --max-tool-calls) max_tool_calls=${2:-}; max_tool_calls_set=1; wait_flags=1; shift 2 || usage ;;
     --detach) [ "$mode" = wait ] || usage; mode=detach; shift ;;
     --result) [ "$mode" = wait ] || usage; mode=result; shift ;;
-    -h|--help) sed -n '3,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) usage ;;
     *) [ -z "$log" ] || usage; log=$1; shift ;;
   esac
@@ -84,30 +85,50 @@ set_watch_paths() {
   watch_pid=$log.await.pid
   watch_out=$log.await.out
   watch_rc=$log.await.rc
-  watch_lock=$log.await.lock
+  watch_lock=$log.await.lock      # held by a --detach while it starts a watcher
+  watch_token=$log.await.token    # names the one start a watcher may come up for
+  watch_wlock=$log.await.wlock    # held by the watcher for as long as it runs
 }
-# A watcher is identified by its command line, not only its pid: a pid file left by
-# a dead watcher can name a pid since reused by something unrelated. The log is
-# always passed as an absolute path and first, so the match is exact.
-watcher_alive() {
-  local p
-  [ -s "$watch_pid" ] || return 1
-  p=$(tr -dc '0-9' 2>/dev/null < "$watch_pid") || return 1
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null || return 1
-  ps -ww -o args= -p "$p" 2>/dev/null | grep -qF -- "await-run.sh $log "
+
+# A process is told apart by its pid and its start time together: a pid file left
+# by a dead watcher can name a pid since reused by something unrelated.
+proc_start() {  # proc_start <pid> -> one word for when it started, or fails if it is gone
+  local s f
+  if [ -r "/proc/$1/stat" ]; then
+    s=$(cat 2>/dev/null < "/proc/$1/stat") || return 1
+    s=${s##*) }   # the command name can hold spaces and parentheses; nothing after it can
+    read -ra f <<< "$s"
+    printf '%s\n' "${f[19]}"
+  else
+    s=$(ps -o lstart= -p "$1" 2>/dev/null) && [ -n "$s" ] || return 1
+    printf '%s\n' "${s// /_}"
+  fi
 }
+record() {  # record <role> -> writes this process into the pid file as <role>
+  { printf '%s %s %s\n' "$1" "$$" "$(proc_start "$$")" > "$watch_pid.$$" &&
+    mv -f "$watch_pid.$$" "$watch_pid"; } 2>/dev/null
+}
+# The pid file names either a watcher, or a --detach still starting one. Sets
+# $rec_role and $rec_pid when the process it names is still that process.
+recorded_alive() {
+  local line st
+  line=$(head -n 1 2>/dev/null < "$watch_pid") || return 1
+  read -r rec_role rec_pid st <<< "$line"
+  [ -n "${rec_pid:-}" ] && [ -n "${st:-}" ] && [ "$(proc_start "$rec_pid")" = "$st" ]
+}
+watcher_alive() { recorded_alive && [ "$rec_role" = watcher ]; }
 
 if [ "$mode" = result ]; then
   gone() {
-    echo "GONE: no watcher is running for $1 and none left a verdict — start one with --detach and the same flags; the count resumes from the log" >&2
+    echo "GONE: no watcher is running for $1 and none left a final verdict — start one with --detach and the same flags; the count resumes from the log" >&2
     exit 8
   }
   given=$log
   log=$(abs_path "$log") || gone "$given"
   set_watch_paths
-  # Sets $rc and $out to a pair the watcher wrote together, or fails. The code is
-  # read on both sides of the output: a stall verdict being replaced or withdrawn
-  # changes it in between, and that pair is not trusted.
+  # Sets $rc and $out to a pair the watcher wrote together, or fails. The watcher
+  # removes the code before it touches the output, so a code that reads the same on
+  # both sides of the output belongs to it.
   # $provisional is set when the watcher is still watching past that verdict.
   read_verdict() {
     local first again
@@ -123,15 +144,13 @@ if [ "$mode" = result ]; then
     if [ "$rc" = 0 ]; then printf '%s\n' "$out"; else printf '%s\n' "$out" >&2; fi
     exit "$rc"
   }
-  # A --detach holds the lock from clearing the old pid file until the new watcher
-  # has written its own, so a held lock is a watcher on its way.
-  starting() { command -v flock >/dev/null && [ -e "$watch_lock" ] && ! flock -n "$watch_lock" true 2>/dev/null; }
   while :; do
     if read_verdict; then
       # A provisional verdict is only true while its watcher is there to keep watching.
       if [ -z "$provisional" ] || watcher_alive; then show_verdict; fi
     fi
-    if ! watcher_alive && ! starting; then
+    # A --detach still starting counts as a watcher on its way.
+    if ! recorded_alive; then
       # The watcher removes its pid file once its last verdict is in place.
       read_verdict && [ -z "$provisional" ] && show_verdict
       gone "$given"
@@ -142,45 +161,62 @@ fi
 
 if [ "$mode" = detach ]; then
   given=$log
-  log=$(abs_path "$log") || { echo "NOT_STARTED: the directory of $given does not exist" >&2; exit 7; }
+  not_started() { echo "NOT_STARTED: $1 — wait in the foreground instead" >&2; exit 7; }
+  log=$(abs_path "$log") || not_started "the directory of $given does not exist"
   if [ -n "$pid_file" ]; then pid_file=$(abs_path "$pid_file" || printf '%s' "$pid_file"); fi
   set_watch_paths
-  not_started() { echo "NOT_STARTED: $1 — wait in the foreground instead" >&2; exit 7; }
   command -v setsid >/dev/null || not_started "setsid is not available, so a watcher would die with this call"
   command -v flock >/dev/null || not_started "flock is not available, so two watchers could start for one log"
   [ -w "$(dirname "$log")" ] || not_started "$(dirname "$log") is not writable, so a watcher could not leave its verdict"
   # Two --detach calls racing for one log must not both start a watcher. The lock
   # is held only while starting; the watcher does not inherit it.
-  exec 9> "$watch_lock"
-  flock -n 9 || { echo "WATCHING: another --detach is starting a watcher for $log — wait on it with --result" >&2; exit 6; }
-  if watcher_alive; then
-    echo "WATCHING: a watcher (pid $(tr -dc '0-9' < "$watch_pid")) already watches $log — wait on it with --result" >&2
+  { exec 9> "$watch_lock"; } 2>/dev/null || not_started "$watch_lock cannot be opened"
+  # A child of a --detach killed a moment ago can hold its copy of the lock briefly.
+  flock -w 1 9 || { echo "WATCHING: another --detach is starting a watcher for $log — wait on it with --result" >&2; exit 6; }
+  if recorded_alive; then
+    echo "WATCHING: a watcher (pid $rec_pid, $rec_role) already watches $log — wait on it with --result" >&2
     exit 6
   fi
   # A verdict left by an earlier watcher would answer --result before this one has looked.
-  rm -f "$watch_rc" "$watch_out" "$watch_pid"
+  rm -f "$watch_rc" "$watch_out"
+  token="$$-$(proc_start "$$")-$RANDOM"
+  if ! { printf '%s\n' "$token" > "$watch_token.$$" && mv -f "$watch_token.$$" "$watch_token"; } 2>/dev/null ||
+    ! record starting; then
+    not_started "the files beside $log cannot be written"
+  fi
   args=("$log" --stall-seconds "$stall_seconds" --poll-seconds "$poll_seconds")
   [ -n "$pid_file" ] && args+=(--pid-file "$pid_file")
   [ -n "$max_tool_calls" ] && args+=(--max-tool-calls "$max_tool_calls")
   self=$(abs_path "${BASH_SOURCE[0]}")
   # Its stderr is kept: a watcher that dies leaves only a GONE behind otherwise.
-  AWAIT_RUN_WATCHER=1 setsid bash "$self" "${args[@]}" </dev/null >/dev/null 2> "$log.await.err" 9>&- &
+  AWAIT_RUN_WATCHER=1 AWAIT_RUN_TOKEN=$token setsid bash "$self" "${args[@]}" \
+    </dev/null >/dev/null 2> "$log.await.err" 9>&- &
   starter=$!
+  # Called on a start that is taking too long or failed. Withdrawing the token makes
+  # a watcher that comes up late exit instead of running beside the foreground wait
+  # that 7 tells the caller to start; one already past that check is kept.
+  abandon() {
+    rm -f "$watch_token"
+    sleep 1 9>&-
+    watcher_alive || [ -f "$watch_rc" ] && return 0
+    recorded_alive && [ "$rec_role" = starting ] && [ "$rec_pid" = $$ ] && rm -f "$watch_pid"
+    not_started "$1"
+  }
   # setsid forks when it is started as a group leader, so its own exit says nothing
-  # about the watcher — only a failing exit does. Returning before the pid file is
-  # written would let a --result right after this read the run as unwatched.
+  # about the watcher — only a failing exit does. Returning before the watcher is
+  # recorded would let a --result right after this read the run as unwatched.
   i=0
   until watcher_alive || [ -f "$watch_rc" ]; do
     if [ -n "$starter" ] && ! kill -0 "$starter" 2>/dev/null; then
       # Not forked, the starter is the watcher, and its exit is the verdict it wrote.
-      wait "$starter" || [ -f "$watch_rc" ] || { echo "NOT_STARTED: the watcher for $log failed to start" >&2; exit 7; }
+      if ! wait "$starter" && [ ! -f "$watch_rc" ]; then abandon "the watcher for $log failed to start"; break; fi
       starter=""
     fi
     i=$((i + 1))
-    [ $i -le 100 ] || { echo "NOT_STARTED: the watcher for $log did not start within 10s" >&2; exit 7; }
-    sleep 0.1
+    if [ $i -gt 100 ]; then abandon "the watcher for $log did not start within 10s"; break; fi
+    sleep 0.1 9>&-
   done
-  echo "WATCHING: a detached watcher is waiting on $given — get its verdict with: await-run.sh '$given' --result"
+  printf 'WATCHING: a detached watcher is waiting on %s — get its verdict with: await-run.sh %q --result\n' "$log" "$log" || true
   exit 0
 fi
 
@@ -188,8 +224,13 @@ watcher=""
 if [ "${AWAIT_RUN_WATCHER:-}" = 1 ]; then
   watcher=1
   set_watch_paths
+  # One watcher per log: a second one that got this far exits here. The wait covers
+  # a watcher killed a moment ago, whose last child can still hold the lock.
+  { exec 8> "$watch_wlock"; } 2>/dev/null && flock -w 2 8 || exit 0
+  # The --detach that started this has given up on it, or a newer one has taken over.
+  [ "$(cat 2>/dev/null < "$watch_token")" = "${AWAIT_RUN_TOKEN:-}" ] || exit 0
   # Unrecorded, it would be invisible to --result and to the next --detach.
-  { printf '%s\n' "$$" > "$watch_pid.$$" && mv -f "$watch_pid.$$" "$watch_pid"; } || exit 1
+  record watcher || exit 1
 fi
 
 # Default to the pid file new-run.sh's layout puts beside the first run's log. A
@@ -243,6 +284,8 @@ report() {
 # What a foreground call would print, written for --result to read. Each file is
 # written under a temporary name and moved into place, the output before the code.
 publish() {  # publish <exit> <verdict line> [provisional]
+  # The code goes first, so --result never pairs a code with output written after it.
+  rm -f "$watch_rc"
   { echo "$2"; report; } > "$watch_out.$$"
   mv -f "$watch_out.$$" "$watch_out"
   { echo "$1"; [ -z "${3:-}" ] || echo provisional; } > "$watch_rc.$$"
@@ -348,5 +391,6 @@ while :; do
     stalled=0
   fi
 
-  sleep "$poll_seconds"
+  # Not handed the watcher's lock: a sleep outliving a killed watcher would hold it.
+  sleep "$poll_seconds" 8>&-
 done
