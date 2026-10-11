@@ -92,7 +92,7 @@ It seeds `<RUN>/prompt.md` from `assets/prompt-template.md`. Everything one dele
 | `prompt.md` | The delegated task, plus the repository rules appended to it |
 | `ca.ndjson` | The complete stream log — the authority for every judgment about the run |
 | `ca.pid`, `ca.err` | The detached run's pid and stderr, written by the invocation below |
-| `<log>.await.*` | A detached watcher's files, written by `await-run.sh --detach`: `.pid` (who is watching), `.out` / `.rc` (its verdict and exit code), `.err` (its stderr) and the locks and token that keep it to one watcher. Named after the log, so a follow-up's watcher never answers for the first run |
+| `<log>.await.*` | A detached watcher's files, written by `await-run.sh --detach`: `.pid` (its pid, for you to read), `.out` / `.rc` (its verdict and exit code), `.err` (the latest watcher's stderr, cleared by each `--detach`), the locks and token that keep it to one watcher, and `.<pid>`-suffixed temporaries a killed watcher can leave. Named after the log, so a follow-up's watcher never answers for the first run |
 | `followup-N.md` | The Nth `--resume` prompt |
 | `ca-followup-N.ndjson` | Its log. Numbered, so a follow-up never overwrites the first log |
 | `check.*` | A throwaway script used to exercise the change when the repo has no test runner |
@@ -158,7 +158,7 @@ Every verdict (any exit but bad usage and `--help`) is followed by how many tool
 
 **`--max-tool-calls N` is the only per-run size limit there is.** cursor-agent has nothing like `claude -p`'s `--max-turns` / `--max-budget-usd`, and `usage` appears only in the final `result` event, so a run cannot be stopped by cost while it is going. The count of `tool_call` / `started` events can be watched, and that is what this flag caps. It is checked once per poll and only while `await-run.sh` is running, so a run overshoots N by the calls it starts between checks and while it is being stopped — and without limit while nothing waits on it, which `--detach` (below) prevents. A run that hits the limit is a task that was sized wrong, not one that needs more turns: resuming it does not shrink the work left, and reloading the session's context makes each remaining turn cost more. Choose N when you write the prompt, from how much the task asks the delegate to read and change; a task you cannot fit under the N you would accept is one to split before dispatching, not after.
 
-It reads `<RUN>/ca.pid` from beside `ca.ndjson`; a follow-up run logging to `ca-followup-N.ndjson` needs `--pid-file`, or the script knows no process to watch or stop. A call that hits the host's per-command timeout can be repeated with the same flags, and the log is unchanged — but the limit is enforced only while a call is waiting, so repeat it at once, or detach the watcher as below.
+It reads `<RUN>/ca.pid` from beside `ca.ndjson`, again on each poll until the file appears; a follow-up run logging to `ca-followup-N.ndjson` needs `--pid-file`, or the script knows no process to watch or stop. A call that hits the host's per-command timeout can be repeated with the same flags, and the log is unchanged — but the limit is enforced only while a call is waiting, so repeat it at once, or detach the watcher as below.
 
 #### Keep the watcher alive past your own call
 
@@ -169,10 +169,10 @@ ${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson --detach [--max-tool-ca
 ${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson --result
 ```
 
-- `--detach` takes the same flags as a foreground wait and returns once the watcher is recorded: 0 started, 6 a watcher already watches this log (wait on it), 7 it could not be started (no `setsid` or `flock` — so not on macOS —, a run directory that is gone or not writable, or a watcher that did not come up) — wait in the foreground instead
+- `--detach` takes the same flags as a foreground wait and returns once the watcher is up: 0 a watcher is up, 6 a watcher already watches this log or another `--detach` is starting one (wait on it with `--result`), 7 none could be started (no `setsid` or `flock` — so not on macOS —, a run directory that is gone or not writable, or a watcher that did not come up) — wait in the foreground instead
 - `--result` prints what a foreground call would and exits with the watcher's code from the table above, waiting until there is one. It only reads files, so repeat it after a host timeout, in a later turn or in a new session
-- **8 from `--result` means no watcher is running and none left a final verdict** — it was killed, or never started. `<log>.await.err` holds what it said before it died. Run the same `--detach` again; the count resumes from the log
-- **After a stall (3) the watcher keeps watching, as long as it knows the run's pid and the run lives.** `--result` returns the 3 at once, with a line saying so. Read the log, then either kill the run, which turns the verdict into 4, or call `--result` again later: the 3 is withdrawn if the log grows again and replaced when the run ends. A follow-up started without `--pid-file` has no pid to watch, and its watcher ends on the 3
+- **8 from `--result` means no watcher is running and none left a final verdict** — it was killed, or never started. `<log>.await.err` holds what it said before it died, until the next `--detach` clears it. Run the same `--detach` again; the count resumes from the log
+- **After a stall (3) the watcher keeps watching, as long as it knows the run's pid and the run lives.** `--result` returns the 3 at once, its verdict line saying so. Read the log, then either kill the run, which turns the verdict into 4, or call `--result` again later: the 3 is withdrawn if the log grows again and replaced when the run ends. A follow-up started without `--pid-file` has no pid to watch, and its watcher ends on the 3
 
 Never poll by process **name**. `pgrep -f cursor-agent` matches the shell running that very command and so waits on itself forever, and the character-class form (`pgrep -f "[c]ursor-agent"`) matches an unrelated concurrent delegation instead.
 

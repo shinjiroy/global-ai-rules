@@ -18,7 +18,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/await-run-test-XXXXXX")
 # A case that fails may leave its sleeper running, and the suite must still end.
 cleanup() {
   for f in "$tmp"/*/*.await.pid; do
-    [ -s "$f" ] && kill -TERM "$(awk '{print $2}' "$f")" 2>/dev/null
+    [ -s "$f" ] && kill -TERM "$(awk '{print $1}' "$f")" 2>/dev/null
   done
   for f in "$tmp"/*/ca.pid "$tmp"/*/child.pid "$tmp"/*/other.pid; do
     [ -s "$f" ] || continue
@@ -292,9 +292,11 @@ aw a --stall-seconds 0 >/dev/null 2>&1;        check "zero stall" 64 $?
 aw a --poll-seconds "" >/dev/null 2>&1;        check "empty poll interval" 64 $?
 
 # --- detached watcher (--detach / --result) ---
-watcher_pid() { awk '{print $2}' "$1.await.pid"; }
+watcher_pid() { awk '{print $1}' "$1.await.pid"; }
 gone_pid() { ! kill -0 "$1" 2>/dev/null && echo 0 || echo 1; }
-watchers_of() { pgrep -fc -- "await-run.sh $1 " || true; }
+# The watcher itself, not the flock holding its lock, whose command line names it too.
+watcher_pids() { pgrep -f -- "await-run.sh $1 " | while read -r p; do [ "$(ps -o comm= -p "$p")" = bash ] && echo "$p"; done; }
+watchers_of() { watcher_pids "$1" | grep -c . || true; }
 no_watchers() { [ "$(watchers_of "$1")" = 0 ]; }
 wait_until() {  # wait_until <seconds> <command...> -> 0 once the command succeeds
   local i=0
@@ -325,8 +327,8 @@ d=$(new_run detach-recorded)
 start_leaky_run "$d" || exit 1
 work_event > "$d/ca.ndjson"
 aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
-read -r role p _ < "$d/ca.ndjson.await.pid"
-note "detach: recorded on return" "the pid file names a live watcher" "$([ "$role" = watcher ] && kill -0 "$p" 2>/dev/null && echo 0 || echo 1)"
+read -r p tok < "$d/ca.ndjson.await.pid"
+note "detach: recorded on return" "the pid file names a live watcher" "$([ -n "$tok" ] && kill -0 "$p" 2>/dev/null && echo 0 || echo 1)"
 timeout 3 "$await" "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
 check "detach: --result right after start keeps waiting" 124 $?
 
@@ -360,7 +362,7 @@ check "detach: follow-up with no watcher of its own" 8 $?
 d=$(new_run detach-killed)
 start_leaky_run "$d" || exit 1
 work_event > "$d/ca.ndjson"
-aw "$d/ca.ndjson" --detach --poll-seconds 5 >/dev/null 2>&1
+aw "$d/ca.ndjson" --detach --poll-seconds 8 >/dev/null 2>&1
 sleep 0.5
 kill -KILL "$(watcher_pid "$d/ca.ndjson")"
 aw "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
@@ -374,10 +376,11 @@ out=$(aw "$d/ca.ndjson" --detach --poll-seconds 1 2>&1); rc=$?
 check "detach: second watcher refused" 6 $rc
 case $out in *"already watches"*) r=0 ;; *) r=1 ;; esac
 note "detach: second watcher refused" "names the running watcher, not a start in progress" $r
-# A second watcher that got past the token check exits instead of taking over.
+# A second watcher started with a valid token does not get the lock, so never runs.
 before=$(cat "$d/ca.ndjson.await.pid")
-AWAIT_RUN_WATCHER=1 AWAIT_RUN_TOKEN=$(cat "$d/ca.ndjson.await.token") timeout 10 bash "$await" "$d/ca.ndjson" --poll-seconds 1 >/dev/null 2>&1
-check "detach: a second watcher with a valid token" 0 $?
+AWAIT_RUN_WATCHER=1 AWAIT_RUN_TOKEN=$(cat "$d/ca.ndjson.await.token") timeout 10 \
+  flock -o -w 1 "$d/ca.ndjson.await.wlock" bash "$await" "$d/ca.ndjson" --poll-seconds 1 >/dev/null 2>&1
+check "detach: a second watcher with a valid token" 1 $?
 note "detach: a second watcher with a valid token" "the pid file still names the first" "$([ "$(cat "$d/ca.ndjson.await.pid")" = "$before" ] && echo 0 || echo 1)"
 note "detach: second watcher refused" "still exactly one watcher" "$([ "$(watchers_of "$d/ca.ndjson")" = 1 ] && echo 0 || echo 1)"
 
@@ -442,7 +445,7 @@ d=$(new_run detach-pid-reused)
 work_event > "$d/ca.ndjson"
 setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > "$d/other.pid"
 sleep 0.2
-echo "watcher $(cat "$d/other.pid") 1" > "$d/ca.ndjson.await.pid"
+echo "$(cat "$d/other.pid") stale-token" > "$d/ca.ndjson.await.pid"
 aw "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
 check "detach: pid reused by another process" 8 $?
 aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
@@ -493,16 +496,28 @@ sleep 1
 note "detach: run pid written late" "the run process is gone" "$(gone_pid "$(cat "$d/ca.pid")")"
 
 # --- 39. --result while a --detach is still starting keeps waiting ---
-# The pid file then names the --detach itself, with its start time.
+# Even over a verdict on disk: that one is the last watcher's.
 d=$(new_run detach-starting)
 work_event > "$d/ca.ndjson"
-sleep 5 & holder=$!
-echo "starting $holder $(awk '{ sub(/.*\) /, ""); split($0, f, " "); print f[20] }' "/proc/$holder/stat")" > "$d/ca.ndjson.await.pid"
+echo 0 > "$d/ca.ndjson.await.rc"; echo "FINISHED: result event present" > "$d/ca.ndjson.await.out"
+flock "$d/ca.ndjson.await.lock" sleep 5 & holder=$!
+sleep 0.3
 timeout 3 "$await" "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
 check "detach: --result during a start" 124 $?
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
-aw "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
-check "detach: --result after the starting --detach died" 8 $?
+# The same with a real --detach, paused just before it clears the last verdict.
+d=$(new_run detach-starting-real)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+echo 0 > "$d/ca.ndjson.await.rc"; echo "FINISHED: result event present" > "$d/ca.ndjson.await.out"
+mkdir -p "$d/slowrm"
+printf '#!/bin/sh\ncase "$*" in *.await.rc*) sleep 4 ;; esac\nexec /bin/rm "$@"\n' > "$d/slowrm/rm"
+chmod +x "$d/slowrm/rm"
+PATH="$d/slowrm:$PATH" aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1 & starter_pid=$!
+sleep 1
+timeout 2 "$await" "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: --result while a real --detach clears the last verdict" 124 $?
+wait "$starter_pid"
 
 # --- 40. concurrent --detach calls start one watcher ---
 d=$(new_run detach-concurrent)
@@ -584,12 +599,13 @@ work_event > "$d/ca.ndjson"
 slow_bash "$d" 3
 PATH="$d/slowbin:$PATH" /bin/bash "$await" "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1 & first=$!
 sleep 1; kill -KILL "$first"; wait "$first" 2>/dev/null
-aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
-check "detach: retry after a killed start" 0 $?
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1; rc=$?
+# The killed start's flock already holds the watcher's lock, so 6 is the truth too.
+note "detach: retry after a killed start" "answers that a watcher runs (0 or 6), got $rc" "$({ [ "$rc" = 0 ] || [ "$rc" = 6 ]; } && echo 0 || echo 1)"
 sleep 4
 note "detach: retry after a killed start" "exactly one watcher runs" "$([ "$(watchers_of "$d/ca.ndjson")" = 1 ] && echo 0 || echo 1)"
-read -r _ p _ < "$d/ca.ndjson.await.pid"
-note "detach: retry after a killed start" "the pid file names that watcher" "$(pgrep -f -- "await-run.sh $d/ca.ndjson " | grep -qx "$p" && echo 0 || echo 1)"
+read -r p _ < "$d/ca.ndjson.await.pid"
+note "detach: retry after a killed start" "the pid file names that watcher" "$(watcher_pids "$d/ca.ndjson" | grep -qx "$p" && echo 0 || echo 1)"
 
 # --- 47. a provisional stall being replaced is never shown with the new output ---
 # An mv that pauses right after placing the output widens the window to seconds.
@@ -638,7 +654,71 @@ wait "$reader"; rc=$?
 case "$rc:$(cat "$d/slow.out")" in 3:STALLED*|4:INTERRUPTED*) r=0 ;; *) r=1 ;; esac
 note "detach: replacement between the reads" "the code came with its own output" $r
 
-# --- 49. --detach answers with its own codes only ---
+# An mv that pauses before the watcher's pid file lands: the watcher has passed its
+# token check, and the --detach waiting on it runs out of time first.
+slow_pid_mv() {  # slow_pid_mv <dir> <seconds>
+  mkdir -p "$1/pidmv"
+  printf '#!/bin/sh\ncase "$*" in *.await.pid) sleep %s ;; esac\nexec /bin/mv "$@"\n' "$2" > "$1/pidmv/mv"
+  chmod +x "$1/pidmv/mv"
+}
+
+# --- 49. a start that runs out of time after the watcher passed its check ---
+# 7 would be false here: the watcher is past the point where it could still stop.
+d=$(new_run detach-late-record)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+slow_pid_mv "$d" 12
+PATH="$d/pidmv:$PATH" timeout 40 /bin/bash "$await" "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1; rc=$?
+check "detach: start timed out past the check" 0 $rc
+note "detach: start timed out past the check" "a watcher runs" "$([ "$(watchers_of "$d/ca.ndjson")" = 1 ] && echo 0 || echo 1)"
+
+# --- 50. a start killed past the check, then retried: one watcher, and it is seen ---
+d=$(new_run detach-killed-past-check)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+slow_pid_mv "$d" 3
+PATH="$d/pidmv:$PATH" /bin/bash "$await" "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1 & first=$!
+sleep 1; kill -KILL "$first"; wait "$first" 2>/dev/null
+PATH="$d/pidmv:$PATH" aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1; rc=$?
+note "detach: retry past the check" "answers that a watcher runs (0 or 6), got $rc" "$({ [ "$rc" = 0 ] || [ "$rc" = 6 ]; } && echo 0 || echo 1)"
+sleep 4
+note "detach: retry past the check" "exactly one watcher runs" "$([ "$(watchers_of "$d/ca.ndjson")" = 1 ] && echo 0 || echo 1)"
+timeout 3 "$await" "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: retry past the check, --result keeps waiting" 124 $?
+
+# --- 51. a symlink to the log itself is the same watcher ---
+d=$(new_run detach-log-symlink)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+ln -s ca.ndjson "$d/link.ndjson"
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+aw "$d/link.ndjson" --detach --pid-file "$d/ca.pid" --poll-seconds 1 >/dev/null 2>&1
+check "detach: --detach through a link to the log is refused" 6 $?
+
+# --- 52. a watcher whose lock holder is gone stops, so a new one can start ---
+d=$(new_run detach-holder-killed)
+start_leaky_run "$d" || exit 1
+work_event > "$d/ca.ndjson"
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+w=$(watcher_pid "$d/ca.ndjson")
+kill -KILL "$(ps -o ppid= -p "$w" | tr -d ' ')"
+wait_until 5 no_watchers "$d/ca.ndjson"
+note "detach: lock holder killed" "the watcher stops" $?
+aw "$d/ca.ndjson" --result --poll-seconds 1 >/dev/null 2>&1
+check "detach: lock holder killed, --result" 8 $?
+aw "$d/ca.ndjson" --detach --poll-seconds 1 >/dev/null 2>&1
+check "detach: restart after the lock holder was killed" 0 $?
+note "detach: restart after the lock holder was killed" "exactly one watcher runs" "$([ "$(watchers_of "$d/ca.ndjson")" = 1 ] && echo 0 || echo 1)"
+
+# --- 53. foreground: a pid file written after the wait started is picked up ---
+d=$(new_run late-pid-foreground)
+work_event > "$d/ca.ndjson"
+# shellcheck disable=SC2016  # expanded by the inner shell, from its own arguments
+( sleep 1; setsid bash -c 'echo $$ > "$1/ca.pid"; exec sleep 2' _ "$d" </dev/null >/dev/null 2>&1 ) &
+aw "$d/ca.ndjson" --stall-seconds 8 --poll-seconds 1 >/dev/null 2>&1
+check "foreground: run pid written late, process gone" 4 $?
+
+# --- 54. --detach answers with its own codes only ---
 d=$(new_run detach-lock-is-dir)
 work_event > "$d/ca.ndjson"
 mkdir "$d/ca.ndjson.await.lock"
@@ -649,7 +729,7 @@ result_event > "$d/ca.ndjson"
 aw "$d/ca.ndjson" --detach --poll-seconds 1 >&- 2>/dev/null
 check "detach: stdout closed" 0 $?
 
-# --- 50. usage errors specific to the detached forms ---
+# --- 55. usage errors specific to the detached forms ---
 aw a --detach --result >/dev/null 2>&1;           check "--detach with --result" 64 $?
 aw a --result --max-tool-calls 3 >/dev/null 2>&1; check "--result with a wait flag" 64 $?
 aw a --result --pid-file p >/dev/null 2>&1;       check "--result with --pid-file" 64 $?
