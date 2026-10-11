@@ -155,9 +155,28 @@ ${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson [--max-tool-calls N]
 
 Every verdict (any exit but bad usage and `--help`) is followed by how many tools the run started, by kind, and the `result` event's token usage when there is one. Exit 0 prints both on stdout; every other exit prints them on stderr.
 
-**`--max-tool-calls N` is the only per-run size limit there is.** cursor-agent has nothing like `claude -p`'s `--max-turns` / `--max-budget-usd`, and `usage` appears only in the final `result` event, so a run cannot be stopped by cost while it is going. The count of `tool_call` / `started` events can be watched, and that is what this flag caps. It is checked once per poll and only while `await-run.sh` is waiting, so a run overshoots N by the calls it starts between checks, while it is being stopped, and while no `await-run.sh` call is running. A run that hits the limit is a task that was sized wrong, not one that needs more turns: resuming it does not shrink the work left, and reloading the session's context makes each remaining turn cost more. Choose N when you write the prompt, from how much the task asks the delegate to read and change; a task you cannot fit under the N you would accept is one to split before dispatching, not after.
+**`--max-tool-calls N` is the only per-run size limit there is.** cursor-agent has nothing like `claude -p`'s `--max-turns` / `--max-budget-usd`, and `usage` appears only in the final `result` event, so a run cannot be stopped by cost while it is going. The count of `tool_call` / `started` events can be watched, and that is what this flag caps. It is checked once per poll and only while `await-run.sh` is running, so a run overshoots N by the calls it starts between checks and while it is being stopped — and without limit while no watcher runs, which is what "Keep the watcher alive past your own call" below prevents. A run that hits the limit is a task that was sized wrong, not one that needs more turns: resuming it does not shrink the work left, and reloading the session's context makes each remaining turn cost more. Choose N when you write the prompt, from how much the task asks the delegate to read and change; a task you cannot fit under the N you would accept is one to split before dispatching, not after.
 
-It reads `<RUN>/ca.pid` from beside `ca.ndjson`; a follow-up run logging to `ca-followup-N.ndjson` needs `--pid-file`, or the script knows no process to watch or stop. A call that hits the host's per-command timeout can be repeated with the same flags, and the log is unchanged — but the limit is enforced only while a call is waiting, so repeat it at once.
+It reads `<RUN>/ca.pid` from beside `ca.ndjson`; a follow-up run logging to `ca-followup-N.ndjson` needs `--pid-file`, or the script knows no process to watch or stop. A call that hits the host's per-command timeout can be repeated with the same flags, and the log is unchanged.
+
+#### Keep the watcher alive past your own call
+
+Run in the foreground, `await-run.sh` stops when your call does — a host timeout, an interrupted turn, a session that ran out of budget — while the detached run keeps going. Its stall check and its tool-call limit stop with it, and the run goes on unwatched until something waits on it again. When the run carries `--max-tool-calls`, or your own session may end before the run does, detach the watcher too and wait on the files it leaves:
+
+```bash
+setsid bash -c 'echo $$ > <RUN>/await.pid; "$0" "$@" > <RUN>/await.out 2>&1; echo $? > <RUN>/await.rc.tmp; mv <RUN>/await.rc.tmp <RUN>/await.rc' \
+  ${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson --max-tool-calls N </dev/null >/dev/null 2>&1 &
+```
+
+```bash
+until [ -f <RUN>/await.rc ] || { [ -s <RUN>/await.pid ] && ! kill -0 "$(cat <RUN>/await.pid)" 2>/dev/null; }; do sleep 10; done
+cat <RUN>/await.out; cat <RUN>/await.rc 2>/dev/null || echo "watcher gone without a verdict"
+```
+
+- `<RUN>/await.rc` holds the exit code from the table above, and `<RUN>/await.out` the verdict and report. The code is written under a temporary name and moved into place, so the wait never reads a half-written one
+- **The wait only reads files**, so it can be repeated after a timeout, in a later turn or in a new session
+- **A watcher gone without `await.rc` was itself killed** (a reboot, a stray signal). Start it again with the same flags; the count picks up from the log, which already holds every call
+- **`await.rc` does not change once written.** After a stall verdict (3), a log that starts growing again leaves the 3 in place: delete `await.rc` and start the watcher again to keep waiting
 
 Never poll by process **name**. `pgrep -f cursor-agent` matches the shell running that very command and so waits on itself forever, and the character-class form (`pgrep -f "[c]ursor-agent"`) matches an unrelated concurrent delegation instead.
 
