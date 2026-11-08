@@ -289,25 +289,95 @@ finish() {  # finish <exit> <verdict line>
   exit "$1"
 }
 
-# Kill the run and every process it started. setsid made it a group leader, so the
-# whole group goes down with one signal — that is what clears a leaked dev server.
-# Signal the lone pid when it is not a leader, so an unrelated group is never hit.
-# Waits on the whole group, not the leader: a child that ignores TERM outlives a
-# leader that obeys it, and only KILL clears it. Sets $reaped to what was signalled.
+# A zombie has exited. kill -0 is still true until its parent reaps it, and KILL
+# does not clear it. A negative argument is a process group: any member counts.
+still_going() {  # still_going <pid or -pgid>
+  kill -0 -- "$1" 2>/dev/null || return 1
+  case $1 in -*) return 0 ;; esac
+  case $(ps -o stat= -p "$1" 2>/dev/null | tr -d '[:space:]' || true) in
+    ''|Z*) return 1 ;;
+  esac
+  return 0
+}
+
+# Stop the run and every descendant still linked to it.
+# The run is signalled with its process group when it leads that group, and on
+# its own pid when it does not, so a group it merely sits in is never signalled.
+# A descendant that leads a group of its own is signalled with that group; any
+# other descendant is signalled on its pid. The tree comes from one process
+# listing read before the first signal: a dead parent reparents its children to
+# pid 1, and the link is gone after that. A descendant that has double-forked
+# onto pid 1 is not in the listing and is left running. A descendant that
+# ignores TERM is killed after the wait. Sets $reaped to what was signalled.
 reap() {
-  local pgid
+  local pgid snapshot targets t i outside going
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -dc '0-9' || true)
-  local target=$pid
-  reaped="with its group (pid $pid)"
-  if [ "$pgid" != "$pid" ]; then
-    reaped="alone (pid $pid is not a group leader, so processes it started may still be running)"
+  snapshot=$(ps -ax -o pid=,ppid=,pgid= 2>/dev/null || true)
+  targets=$(printf '%s\n' "$snapshot" | awk -v root="$pid" -v rpgid="$pgid" '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      pg[$1] = $3
+      kids[$2] = kids[$2] " " $1
+    }
+    END {
+      if (rpgid != "" && rpgid == root) {
+        print "-" root
+        signaled[rpgid] = 1
+      } else
+        print root
+      q[0] = root
+      n = 1
+      for (i = 0; i < n; i++) {
+        m = split(kids[q[i]], cs, " ")
+        for (j = 1; j <= m; j++) {
+          c = cs[j]
+          if (c !~ /^[0-9]+$/ || seen[c]) continue
+          seen[c] = 1
+          q[n++] = c
+          g = pg[c]
+          if (g ~ /^[0-9]+$/ && g == c) {
+            if (!signaled[g]) {
+              print "-" c
+              signaled[g] = 1
+            }
+          } else if (!(g ~ /^[0-9]+$/) || !signaled[g])
+            print c
+        }
+      }
+    }
+  ')
+  outside=0
+  while IFS= read -r t; do
+    case $t in
+      ""|"$pid"|"-$pid") ;;
+      *) outside=1 ;;
+    esac
+  done <<< "$targets"
+  if [ "$pgid" = "$pid" ]; then
+    reaped="with its group (pid $pid)"
+    [ "$outside" = 1 ] && reaped="$reaped and descendants outside it"
   else
-    target="-$pid"
+    reaped="alone (pid $pid is not a group leader)"
+    [ "$outside" = 1 ] && reaped="$reaped; its descendants were stopped"
   fi
-  kill -TERM "$target" 2>/dev/null || true
-  local i=0
-  while [ $i -lt 10 ] && kill -0 -- "$target" 2>/dev/null; do sleep 1; i=$((i + 1)); done
-  kill -0 -- "$target" 2>/dev/null && kill -KILL -- "$target" 2>/dev/null || true
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    kill -TERM "$t" 2>/dev/null || true
+  done <<< "$targets"
+  i=0
+  while [ "$i" -lt 10 ]; do
+    going=0
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      if still_going "$t"; then going=1; break; fi
+    done <<< "$targets"
+    [ "$going" = 0 ] && break
+    sleep 1
+    i=$((i + 1))
+  done
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    still_going "$t" && kill -KILL -- "$t" 2>/dev/null || true
+  done <<< "$targets"
 }
 
 # Nothing has been written yet on the first poll, so the stall clock starts here.
