@@ -133,7 +133,7 @@ The live `jq` view is lost — read `<RUN>/ca.ndjson` instead — but the run fi
 
 - **The inner shell records its own `$$` and then `exec`s**, so the pid file holds the run itself. `echo $! > <RUN>/ca.pid` does not work here: `setsid` forks, so `$!` is a wrapper that exits immediately, and polling it reports the run as finished seconds after it started
 - **stderr goes to its own file.** Merged into the log it breaks the NDJSON, and every `jq` query over the run then fails
-- `setsid` is Linux; where it is absent, use whatever detaches a process on that host. A run that is not a process-group leader can only be stopped by itself — anything it started survives — and `await-run.sh` says so when it kills one
+- `setsid` is Linux; where it is absent, use whatever detaches a process on that host. A run that is not a process-group leader is signalled on its own, so an unrelated process sharing its group is never hit, and `await-run.sh` says so when it kills one. Descendants of the run are still stopped, including one that moved to another session; a descendant that has double-forked onto pid 1 is left running
 
 **Do not run the `| tee | jq` pipeline in the foreground and wait on it instead.** It is the shorter shape, and it is exposed to the same leaked child the next section is about, in a form nothing can rescue: a dev server the delegate started inherits the pipeline's stdout, so `tee` never sees EOF and the call blocks even after cursor-agent has exited with its `result` already written to the log. Measured — the log held `{"type":"result",…}` while the pipeline sat there until the host's timeout killed it. Because the blocked call is your own, no wait loop runs and `await-run.sh` is never reached. Detaching writes the log with a plain redirect, so nothing is holding a pipe open.
 
@@ -145,7 +145,7 @@ The one place the foreground pipeline still belongs is a short plan-mode run, wh
 ${CLAUDE_SKILL_DIR}/scripts/await-run.sh <RUN>/ca.ndjson [--max-tool-calls N]
 ```
 
-**A run is over when `<RUN>/ca.ndjson` carries a `result` event.** Process liveness is not the signal: cursor-agent stays alive as long as it holds a foreground child it started — a dev server, a file watcher — so a loop like `while kill -0 "$(cat <RUN>/ca.pid)"; do sleep 30; done` blocks long after the delegate finished, with the completed result already sitting in the log (measured: 16 minutes). `await-run.sh` returns on the event, then kills the run's whole process group, which is what clears the leaked child.
+**A run is over when `<RUN>/ca.ndjson` carries a `result` event.** Process liveness is not the signal: cursor-agent stays alive as long as it holds a foreground child it started — a dev server, a file watcher — so a loop like `while kill -0 "$(cat <RUN>/ca.pid)"; do sleep 30; done` blocks long after the delegate finished, with the completed result already sitting in the log (measured: 16 minutes). `await-run.sh` returns on the event, then kills the run, the process group it leads, and any descendant that moved to another session. That is what clears a leaked child.
 
 | Exit | Meaning |
 | --- | --- |

@@ -20,9 +20,17 @@ cleanup() {
   for f in "$tmp"/*/*.await.pid; do
     [ -s "$f" ] && kill -TERM "$(awk '{print $1}' "$f")" 2>/dev/null
   done
-  for f in "$tmp"/*/ca.pid "$tmp"/*/child.pid "$tmp"/*/other.pid; do
+  for f in "$tmp"/*/ca.pid "$tmp"/*/child.pid "$tmp"/*/other.pid \
+           "$tmp"/*/worker.pid "$tmp"/*/grandchild.pid "$tmp"/*/leader.pid; do
     [ -s "$f" ] || continue
-    kill -TERM -"$(cat "$f")" 2>/dev/null || kill -TERM "$(cat "$f")" 2>/dev/null || true
+    pid=$(tr -dc '0-9' < "$f")
+    [ -n "$pid" ] || continue
+    # A descendant that ignores TERM survives the first signal, and one that
+    # left the run's group is not reached by signalling the run's group.
+    kill -TERM -"$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+    kill -KILL -"$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
   done
   rm -rf "$tmp"
 }
@@ -735,5 +743,154 @@ aw a --result --max-tool-calls 3 >/dev/null 2>&1; check "--result with a wait fl
 aw a --result --pid-file p >/dev/null 2>&1;       check "--result with --pid-file" 64 $?
 aw a --detach --max-tool-calls 0 >/dev/null 2>&1; check "--detach validates before starting" 64 $?
 
+# The grandchild's session is not the worker's, so the worker's group does not
+# contain it. $2 is the body of grandchild.sh.
+start_sessioned_run() {  # start_sessioned_run <dir> <grandchild script>
+  local d=$1
+  printf '%s\n' "$2" > "$d/grandchild.sh"
+  cat > "$d/worker.sh" <<'RUN'
+d=$1
+echo $$ > "$d/worker.pid"
+setsid bash "$d/grandchild.sh" "$d" &
+exec sleep 300
+RUN
+  cat > "$d/run.sh" <<'RUN'
+d=$1
+echo $$ > "$d/ca.pid"
+setsid bash "$d/worker.sh" "$d" &
+exec sleep 300
+RUN
+  setsid bash -c 'echo $$ > "'"$d"'/other.pid"; exec sleep 300' </dev/null >/dev/null 2>&1 &
+  setsid bash "$d/run.sh" "$d" </dev/null >/dev/null 2>&1 &
+  local i=0
+  while [ ! -s "$d/ca.pid" ] || [ ! -s "$d/worker.pid" ] || [ ! -s "$d/grandchild.pid" ] || [ ! -s "$d/other.pid" ]; do
+    sleep 0.1; i=$((i + 1)); [ "$i" -gt 50 ] && { echo "sessioned sleeper did not start" >&2; return 1; }
+  done
+  i=0
+  local gc wc oc
+  while :; do
+    gc=$(ps -o comm= -p "$(cat "$d/grandchild.pid")" 2>/dev/null || true)
+    wc=$(ps -o comm= -p "$(cat "$d/worker.pid")" 2>/dev/null || true)
+    oc=$(ps -o comm= -p "$(cat "$d/other.pid")" 2>/dev/null || true)
+    [ "$gc" = sleep ] && [ "$wc" = sleep ] && [ "$oc" = sleep ] && break
+    i=$((i + 1))
+    [ "$i" -gt 30 ] && { echo "fixture: comms are '$gc' '$wc' '$oc'" >&2; return 1; }
+    sleep 0.1
+  done
+  local rp rs wp ws gp gs
+  rp=$(ps -o pgid= -p "$(cat "$d/ca.pid")" | tr -dc '0-9')
+  rs=$(ps -o sess= -p "$(cat "$d/ca.pid")" | tr -dc '0-9')
+  wp=$(ps -o pgid= -p "$(cat "$d/worker.pid")" | tr -dc '0-9')
+  ws=$(ps -o sess= -p "$(cat "$d/worker.pid")" | tr -dc '0-9')
+  gp=$(ps -o pgid= -p "$(cat "$d/grandchild.pid")" | tr -dc '0-9')
+  gs=$(ps -o sess= -p "$(cat "$d/grandchild.pid")" | tr -dc '0-9')
+  [ -n "$gp" ] && [ "$wp" != "$rp" ] && [ "$gp" != "$wp" ] && [ "$gp" != "$rp" ] &&
+    [ "$ws" != "$rs" ] && [ "$gs" != "$ws" ] && [ "$gs" != "$rs" ] || {
+    echo "fixture: descendant did not leave the run's session (run $rp/$rs worker $wp/$ws grandchild $gp/$gs)" >&2
+    return 1
+  }
+}
+
+# --- 56. a descendant that moved to its own session is stopped, and so is its child ---
+# The grandchild leads a third session. An unrelated sleep of the same name stays.
+d=$(new_run other-session)
+start_sessioned_run "$d" 'd=$1
+echo $$ > "$d/grandchild.pid"
+exec sleep 300
+' || exit 1
+{ work_event; result_event; } > "$d/ca.ndjson"
+out=$(aw "$d/ca.ndjson" --poll-seconds 1 2>&1); rc=$?
+check "descendant in another session" 0 $rc
+want="was killed with its group (pid $(cat "$d/ca.pid")) and descendants outside it"
+case $out in *"$want"*) r=0 ;; *) r=1 ;; esac
+note "descendant in another session" "reports the group and the descendants outside it" $r
+sleep 1
+kill -0 "$(cat "$d/ca.pid")" 2>/dev/null; r=$?
+note "descendant in another session" "the run process is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
+kill -0 "$(cat "$d/worker.pid")" 2>/dev/null; r=$?
+note "descendant in another session" "the worker in the other session is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
+kill -0 "$(cat "$d/grandchild.pid")" 2>/dev/null; r=$?
+note "descendant in another session" "the grandchild in a further session is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
+kill -0 "$(cat "$d/other.pid")" 2>/dev/null; r=$?
+note "descendant in another session" "an unrelated process of the same name is still running" "$r"
+
+# --- 57. a descendant in another session that ignores TERM is killed ---
+# The fixture sends TERM first and requires the process to still be there.
+d=$(new_run other-session-ignores-term)
+start_sessioned_run "$d" 'd=$1
+trap "" TERM
+echo $$ > "$d/grandchild.pid"
+exec sleep 300
+' || exit 1
+kill -TERM "$(cat "$d/grandchild.pid")" 2>/dev/null || true
+sleep 0.3
+kill -0 "$(cat "$d/grandchild.pid")" 2>/dev/null || { echo "fixture: grandchild died from TERM" >&2; exit 1; }
+{ work_event; result_event; } > "$d/ca.ndjson"
+aw "$d/ca.ndjson" --poll-seconds 1 >/dev/null 2>&1
+check "descendant ignoring TERM in another session" 0 $?
+sleep 1
+kill -0 "$(cat "$d/grandchild.pid")" 2>/dev/null; r=$?
+note "descendant ignoring TERM in another session" "the grandchild is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
+kill -0 "$(cat "$d/other.pid")" 2>/dev/null; r=$?
+note "descendant ignoring TERM in another session" "an unrelated process of the same name is still running" "$r"
+
+# --- 58. a run that is not a group leader is signalled alone; its descendants still stop ---
+# The leader shares the run's group. Signalling that group would take the leader.
+# It waits, so an exited run is reaped, then keeps running.
+d=$(new_run not-group-leader)
+cat > "$d/worker.sh" <<'RUN'
+d=$1
+echo $$ > "$d/worker.pid"
+exec sleep 300
+RUN
+cat > "$d/run.sh" <<'RUN'
+d=$1
+echo $$ > "$d/ca.pid"
+sleep 300 & echo $! > "$d/child.pid"
+setsid bash "$d/worker.sh" "$d" &
+exec sleep 300
+RUN
+cat > "$d/leader.sh" <<'RUN'
+d=$1
+echo $$ > "$d/leader.pid"
+bash "$d/run.sh" "$d" &
+wait
+exec sleep 300
+RUN
+setsid bash "$d/leader.sh" "$d" </dev/null >/dev/null 2>&1 &
+i=0
+while [ ! -s "$d/leader.pid" ] || [ ! -s "$d/ca.pid" ] || [ ! -s "$d/child.pid" ] || [ ! -s "$d/worker.pid" ]; do
+  sleep 0.1; i=$((i + 1)); [ "$i" -gt 50 ] && { echo "non-leader sleeper did not start" >&2; exit 1; }
+done
+sleep 0.2
+leader=$(cat "$d/leader.pid")
+run=$(cat "$d/ca.pid")
+run_pgid=$(ps -o pgid= -p "$run" | tr -dc '0-9')
+child_pgid=$(ps -o pgid= -p "$(cat "$d/child.pid")" | tr -dc '0-9')
+worker_pgid=$(ps -o pgid= -p "$(cat "$d/worker.pid")" | tr -dc '0-9')
+[ "$run_pgid" = "$leader" ] && [ "$run" != "$leader" ] && [ "$child_pgid" = "$leader" ] &&
+  [ "$worker_pgid" != "$run_pgid" ] || {
+  echo "fixture: run is not sitting in the leader's group (leader $leader run $run/$run_pgid child $child_pgid worker $worker_pgid)" >&2
+  exit 1
+}
+{ work_event; result_event; } > "$d/ca.ndjson"
+out=$(aw "$d/ca.ndjson" --poll-seconds 1 2>&1); rc=$?
+check "run is not a group leader" 0 $rc
+want="was killed alone (pid $run is not a group leader); its descendants were stopped"
+case $out in *"$want"*) r=0 ;; *) r=1 ;; esac
+note "run is not a group leader" "reports a lone signal and that descendants were stopped" $r
+case $out in *"with its group"*) r=1 ;; *) r=0 ;; esac
+note "run is not a group leader" "does not claim the group was signalled" $r
+sleep 1
+kill -0 "$leader" 2>/dev/null; r=$?
+note "run is not a group leader" "the group leader is still running" "$r"
+kill -0 "$run" 2>/dev/null; r=$?
+note "run is not a group leader" "the run process is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
+kill -0 "$(cat "$d/child.pid")" 2>/dev/null; r=$?
+note "run is not a group leader" "the child in that group is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
+kill -0 "$(cat "$d/worker.pid")" 2>/dev/null; r=$?
+note "run is not a group leader" "the worker in the other session is gone" "$([ $r -ne 0 ] && echo 0 || echo 1)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
+
